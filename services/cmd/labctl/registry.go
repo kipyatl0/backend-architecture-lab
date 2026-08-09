@@ -34,15 +34,29 @@ type Registry struct {
 // значение. Иначе один и тот же стенд давал бы студенту и автору курса
 // разные числа, и сверять свой вывод с текстом шага стало бы нельзя.
 type Script struct {
-	ID       string            `json:"id"`
-	Config   ScriptConfig      `json:"config"`
-	Fields   map[string]string `json:"fields"`
-	Header   []string          `json:"header"`
-	Timeline []Line            `json:"timeline"`
-	Summary  string            `json:"summary"`
+	ID     string            `json:"id"`
+	Config ScriptConfig      `json:"config"`
+	Fields map[string]string `json:"fields"`
+	Header []string          `json:"header"`
+	// Чем сцена печатает результат: timeline двух сторон обмена (по умолчанию)
+	// или таблица замеров. Форма выбирается предметом: обмен читается лентой,
+	// нагрузка — таблицей.
+	Render   string `json:"render"`
+	Timeline []Line `json:"timeline"`
+	Table    Table  `json:"table"`
+	// Наблюдения, которые сцена видит, но в ленту не печатает: обычно это
+	// вторая сторона уже показанного обмена. Перечислять их обязательно —
+	// иначе «вне сценария наблюдалось событие» перестанет ловить дрейф стенда.
+	Ignore  []string `json:"ignore"`
+	Summary string   `json:"summary"`
+	Legend  []string `json:"legend"`
 }
 
+// ScriptConfig — все ручки, которыми сцена настраивает стенд. Числа сцены
+// живут здесь и только здесь: в текст шага они попадают из эталонного вывода,
+// а не переписываются руками.
 type ScriptConfig struct {
+	// эквайринг и заказ
 	AcquirerDelayMS int     `json:"acquirer_delay_ms"`
 	AcquirerMode    string  `json:"acquirer_mode"`
 	Idempotent      bool    `json:"idempotent"`
@@ -52,6 +66,67 @@ type ScriptConfig struct {
 	FirstOrderID    int64   `json:"first_order_id"`
 	ClientTimeoutMS int     `json:"client_timeout_ms"`
 	RetryAtS        float64 `json:"retry_at_s"`
+
+	// служба: обработчик, пул и очередь
+	CatalogMS  int `json:"catalog_ms"`
+	SlowEveryN int `json:"slow_every_n"`
+	SlowMS     int `json:"slow_ms"`
+	Workers    int `json:"workers"`
+	Queue      int `json:"queue"`
+
+	// нагрузка
+	Steps       []int     `json:"steps"`
+	StepSeconds float64   `json:"step_seconds"`
+	RPS         int       `json:"rps"`
+	Seconds     float64   `json:"seconds"`
+	Buckets     []float64 `json:"buckets"`
+	Slices      []float64 `json:"slices"`
+
+	// уведомления и защиты
+	NotifyMode      string `json:"notify_mode"`
+	NotifyMS        int    `json:"notify_ms"`
+	NotifyTimeoutMS int    `json:"notify_timeout_ms"`
+	NotifyRetries   int    `json:"notify_retries"`
+	NotifyRetryMS   int    `json:"notify_retry_ms"`
+	ClientRetries   int    `json:"client_retries"`
+	ProviderRetries int    `json:"provider_retries"`
+	BreakerFails    int    `json:"breaker_fails"`
+	BreakerOpenMS   int    `json:"breaker_open_ms"`
+
+	// порча сети
+	LatencyMS int `json:"latency_ms"`
+	CutAfterB int `json:"cut_after_bytes"`
+}
+
+// ── таблица замеров ─────────────────────────────────────────────────────────
+
+type Table struct {
+	Columns []Column `json:"columns"`
+	Rows    []Row    `json:"rows"`
+}
+
+type Column struct {
+	Title string `json:"title"`
+	Right bool   `json:"right"`
+}
+
+// Row — строка таблицы. Cells печатаются как есть (сценарные значения),
+// Checks сверяются с наблюдением: тот же контракт, что у timeline.
+type Row struct {
+	Key    string   `json:"key"`
+	Cells  []string `json:"cells"`
+	Checks []Check  `json:"checks"`
+	Rule   bool     `json:"rule"`  // горизонтальная черта перед строкой
+	Label  string   `json:"label"` // подпись блока вместо строки таблицы
+}
+
+type Check struct {
+	Field  string   `json:"field"`
+	Value  float64  `json:"value"`
+	Tol    float64  `json:"tol"`
+	TolPct float64  `json:"tol_pct"`
+	Min    *float64 `json:"min"`
+	Max    *float64 `json:"max"`
 }
 
 type Line struct {

@@ -1,0 +1,50 @@
+{
+  "id": "8",
+  "render": "table",
+
+  "config": {
+    "amount": 1890,
+    "client": "Ирина",
+    "restaurant": "Пекарня «Батон»",
+    "first_order_id": 7714,
+    "notify_timeout_ms": 2000
+  },
+
+  "fields": {},
+
+  "header": [
+    "Сервис уведомлений жив: процесс на месте, порт слушает, проверки отвечают",
+    "Работу он при этом не делает — запросы принимает и молчит",
+    "Таймаут вызова уведомлений — {{notify_timeout}}"
+  ],
+
+  "table": {
+    "columns": [
+      { "title": "Что спросили", "right": false },
+      { "title": "Ответ", "right": false },
+      { "title": "Ждали", "right": true }
+    ],
+    "rows": [
+      { "key": "health#1", "cells": ["GET /health у сервиса уведомлений", "200 alive", "1 мс"],
+        "checks": [{ "field": "code", "value": 200, "tol": 0.5 },
+                   { "field": "elapsed_ms", "value": 2, "tol": 300 }] },
+      { "key": "ready#1", "cells": ["GET /ready у сервиса уведомлений", "200 ready", "1 мс"],
+        "checks": [{ "field": "code", "value": 200, "tol": 0.5 },
+                   { "field": "elapsed_ms", "value": 1, "tol": 300 }] },
+      { "key": "order#1", "cells": ["POST /orders — настоящая работа", "502 после таймаута", "2007 мс"],
+        "checks": [{ "field": "code", "value": 502, "tol": 0.5 },
+                   { "field": "elapsed_ms", "value": 2007, "tol": 800 }] },
+      { "key": "health#2", "cells": ["GET /health ещё раз", "200 alive", "1 мс"],
+        "checks": [{ "field": "code", "value": 200, "tol": 0.5 }] },
+      { "key": "ready#2", "cells": ["GET /ready ещё раз", "200 ready", "1 мс"],
+        "checks": [{ "field": "code", "value": 200, "tol": 0.5 }] }
+    ]
+  },
+
+  "summary": "ИТОГ: платформа считает сервис исправным и трафик к нему не прекращает; не проходит при этом ни один заказ",
+
+  "legend": [
+    "Проверка здоровья отвечает за себя, а не за работу: она проверяет, что процесс жив, а не что он делает дело.",
+    "Ровно поэтому серый отказ переживает и перезапуск по проверке, и балансировщик: формально всё зелёное."
+  ]
+}

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kipyatl0/backend-architecture-lab/services/internal/lab"
@@ -67,6 +68,21 @@ type app struct {
 	acquirer string
 	client   *http.Client
 	attempts atomic.Int64
+
+	// Управляемая сценой часть службы: пул, очередь, поведение уведомлений,
+	// повторы и предохранитель. См. control.go.
+	ctl *control
+	// Пусто в профиле mono (модуль уведомлений живёт в этом же процессе) и
+	// заполнено в профиле split (модуль уехал за сеть).
+	notifier     string
+	notifyClient *http.Client
+}
+
+// querier — то общее, что есть у пула и у транзакции. Модуль уведомлений в
+// профиле mono пишет строку в ТОЙ ЖЕ транзакции, что и заказ: так эта система
+// была написана, и курс на этом стоит.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 func main() {
@@ -90,15 +106,35 @@ func main() {
 		log:      log,
 		acquirer: lab.Env("LAB_ACQUIRER_URL", "http://acquirer:8090"),
 		client:   &http.Client{Timeout: lab.EnvDuration("LAB_ACQUIRER_TIMEOUT", 120*time.Second)},
+		ctl:      newControl(),
+		notifier: lab.Env("LAB_NOTIFIER_URL", ""),
+		// Таймаут вызова уведомлений задаёт сцена, а не клиент: в курсе
+		// таймаут — часть контракта, и трогать его должен тот, кто ставит опыт.
+		notifyClient: &http.Client{},
+	}
+	if a.notifier == "" {
+		log.Info("уведомления — модуль этого же процесса")
+	} else {
+		log.Info("уведомления — отдельный сервис за сетью", "url", a.notifier)
 	}
 
 	mux := http.NewServeMux()
-	lab.Health(mux, func() error { return pool.Ping(context.Background()) })
+	lab.Health(mux, func() error {
+		if a.ctl.draining.Load() {
+			return fmt.Errorf("останавливаемся")
+		}
+		return pool.Ping(context.Background())
+	})
 	mux.HandleFunc("POST /orders", a.handleCreateOrder)
 	mux.HandleFunc("GET /orders/{id}", a.handleGetOrder)
+	mux.HandleFunc("GET /catalog", a.handleCatalog)
 	mux.HandleFunc("GET /_lab/events", a.rec.Handler())
 	mux.HandleFunc("POST /_lab/prepare", a.handlePrepare)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
+	mux.HandleFunc("POST /_lab/config", a.handleLabConfig)
+	mux.HandleFunc("GET /_lab/metrics", a.handleLabMetrics)
+	mux.HandleFunc("GET /_lab/buckets", a.handleLabBuckets)
+	mux.HandleFunc("POST /_lab/shutdown", a.handleLabShutdown)
 
 	if err := lab.Serve(lab.Env("LAB_ADDR", ":8080"), mux, log, nil); err != nil {
 		log.Error("сервис остановлен с ошибкой", "err", err)
@@ -147,6 +183,19 @@ func (a *app) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	attempt := a.attempts.Add(1)
+
+	// Заказы и каталог делят один пул обработчиков — как и было в одном
+	// процессе. Пока пул не ограничен (сцены m01–m04), это ничего не меняет;
+	// в m05 именно отсюда берётся каскад: медленная зависимость заказа
+	// съедает обработчиков, и падает каталог, который ни в чём не виноват.
+	release, ok := a.ctl.gate.Acquire(r.Context())
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		lab.WriteJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "очередь заполнена", "code": "overloaded"})
+		return
+	}
+	defer release()
 
 	// Клиент отвалился по таймауту — а работа продолжается: соединение
 	// закрыто, но заказ уже создан и платёж уже ушёл в эквайринг. Ровно это
@@ -230,10 +279,19 @@ func (a *app) createOrder(ctx context.Context, req createOrderRequest, attempt i
 		orderID, courier); err != nil {
 		return res, fmt.Errorf("courier insert: %w", err)
 	}
+	// Модуль уведомлений. В профиле mono он здесь же, в этой же транзакции;
+	// в профиле split — за сетью, и у того же вызова появляется третий исход.
 	body := fmt.Sprintf("Заказ %d оплачен, курьер %s уже едет", orderID, courier)
-	if _, err = tx.Exec(ctx, `INSERT INTO notifications (order_id, channel, body) VALUES ($1,'push',$2)`,
-		orderID, body); err != nil {
-		return res, fmt.Errorf("notification insert: %w", err)
+	if _, err = a.notify(ctx, tx, orderID, body, attempt); err != nil {
+		if !a.ctl.knobs().Degrade {
+			return res, fmt.Errorf("уведомления: %w", err)
+		}
+		// Деградация: заказ принимается без необязательной части. Это
+		// решение вызывающего, а не случайность, и оно попадает в журнал.
+		a.rec.Record(fmt.Sprintf("orders.degrade#%d", attempt),
+			map[string]string{"order": order, "reason": err.Error()})
+		a.log.Info("уведомление не отправлено, заказ принят без него",
+			"order", orderID, "err", err)
 	}
 
 	if err = tx.Commit(ctx); err != nil {

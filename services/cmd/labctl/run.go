@@ -21,31 +21,49 @@ type Run struct {
 	Script Script
 	T0     time.Time
 
-	MonolithURL string
-	AcquirerURL string
+	MonolithURL  string
+	AcquirerURL  string
+	NotifierURL  string
+	ToxiproxyURL string
 
 	ctl       *http.Client
 	own       lab.Recorder
 	collected []lab.Event
 	fields    map[string]string
+	// Замеры табличных сцен: строка таблицы → поле → наблюдение.
+	measured map[string]map[string]float64
 }
 
 func newRun(scene Scene, script Script) *Run {
 	return &Run{
-		Scene:       scene,
-		Script:      script,
-		MonolithURL: lab.Env("LAB_MONOLITH_URL", "http://monolith:8080"),
-		AcquirerURL: lab.Env("LAB_ACQUIRER_URL", "http://acquirer:8090"),
+		Scene:        scene,
+		Script:       script,
+		MonolithURL:  lab.Env("LAB_MONOLITH_URL", "http://monolith:8080"),
+		AcquirerURL:  lab.Env("LAB_ACQUIRER_URL", "http://acquirer:8090"),
+		NotifierURL:  lab.Env("LAB_NOTIFIER_URL", "http://notifier:8070"),
+		ToxiproxyURL: lab.Env("LAB_TOXIPROXY_URL", "http://toxiproxy:8474"),
 		// Управляющий клиент — не участник сцены: его таймаут щедрый,
 		// иначе он сам стал бы источником отказа.
-		ctl:    &http.Client{Timeout: 30 * time.Second},
-		fields: map[string]string{},
+		ctl:      &http.Client{Timeout: 60 * time.Second},
+		fields:   map[string]string{},
+		measured: map[string]map[string]float64{},
 	}
 }
 
 func (r *Run) Record(key string, fields map[string]string) { r.own.Record(key, fields) }
 
 func (r *Run) Set(key, value string) { r.fields[key] = value }
+
+// Measure кладёт наблюдение под ключ строки таблицы. Печатается при этом
+// сценарное значение — наблюдение только сверяется с ним.
+func (r *Run) Measure(key, field string, v float64) {
+	if r.measured[key] == nil {
+		r.measured[key] = map[string]float64{}
+	}
+	r.measured[key][field] = v
+}
+
+func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 
 // SleepUntil ждёт до заданного смещения от начала сцены. Именно так сцена
 // удерживает расписание: повтор клиента случается не «когда получится», а
@@ -155,6 +173,64 @@ func (r *Run) waitForScript(ctx context.Context) error {
 
 // report собирает вывод сцены и список расхождений со сценарием.
 func (r *Run) report(explain bool) (string, []string) {
+	if r.Script.Render == "table" {
+		return r.reportTable(explain)
+	}
+	return r.reportTimeline(explain)
+}
+
+// head — общая шапка любой сцены: чья она, что показывает и можно ли сверять
+// числа буква в букву.
+func (r *Run) head(b *strings.Builder) {
+	determinism := "детерминирована"
+	if !r.Scene.Deterministic {
+		determinism = "НЕдетерминирована — сверяй класс исхода, а не числа"
+	}
+	fmt.Fprintf(b, "Сцена %s · %s · профиль %s · %s\n",
+		r.Scene.ID, r.Scene.Lesson, r.Scene.Profile, determinism)
+	fmt.Fprintf(b, "%s\n", r.Scene.Title)
+	for _, h := range r.Script.Header {
+		fmt.Fprintf(b, "%s\n", substitute(h, r.fields, r.Script.Fields))
+	}
+}
+
+func (r *Run) tail(b *strings.Builder, explain bool, chrono []string) {
+	if len(r.Script.Legend) > 0 {
+		b.WriteString("\n")
+		for _, l := range r.Script.Legend {
+			b.WriteString(substitute(l, r.fields, r.Script.Fields) + "\n")
+		}
+	}
+	if !explain {
+		return
+	}
+	b.WriteString("\nЧТО СМОТРЕТЬ\n")
+	for _, e := range r.Scene.Explain {
+		b.WriteString("  · " + substitute(e, r.fields, r.Script.Fields) + "\n")
+	}
+	b.WriteString("\nСВЕРКА наблюдения со сценарием (в текст шага не копируется)\n")
+	for _, c := range chrono {
+		b.WriteString(c + "\n")
+	}
+}
+
+func (r *Run) reportTable(explain bool) (string, []string) {
+	problems, chrono := verifyTable(r.Script.Table, r.measured)
+
+	var b strings.Builder
+	r.head(&b)
+	b.WriteString("\n")
+	for _, line := range renderTable(r.Script.Table, r.fields, r.Script.Fields) {
+		b.WriteString(line + "\n")
+	}
+	if s := substitute(r.Script.Summary, r.fields, r.Script.Fields); s != "" {
+		b.WriteString(s + "\n")
+	}
+	r.tail(&b, explain, chrono)
+	return b.String(), problems
+}
+
+func (r *Run) reportTimeline(explain bool) (string, []string) {
 	events := map[string]lab.Event{}
 	for _, e := range r.collected {
 		if _, dup := events[e.Key]; !dup {
@@ -192,6 +268,9 @@ func (r *Run) report(explain bool) (string, []string) {
 		chrono = append(chrono, fmt.Sprintf("  %sсценарий %7.3f   наблюдение %7.3f   Δ %+.3f",
 			pad(l.Key, 26), l.At, obs, delta))
 	}
+	for _, k := range r.Script.Ignore {
+		inScript[k] = true
+	}
 	for _, e := range r.collected {
 		if !inScript[e.Key] {
 			problems = append(problems, "вне сценария наблюдалось событие "+e.Key)
@@ -199,32 +278,13 @@ func (r *Run) report(explain bool) (string, []string) {
 	}
 
 	var b strings.Builder
-	determinism := "детерминирована"
-	if !r.Scene.Deterministic {
-		determinism = "НЕдетерминирована — сверяй класс исхода, а не числа"
-	}
-	fmt.Fprintf(&b, "Сцена %s · %s · профиль %s · %s\n",
-		r.Scene.ID, r.Scene.Lesson, r.Scene.Profile, determinism)
-	fmt.Fprintf(&b, "%s\n", r.Scene.Title)
-	for _, h := range r.Script.Header {
-		fmt.Fprintf(&b, "%s\n", substitute(h, r.fields, r.Script.Fields))
-	}
+	r.head(&b)
 	b.WriteString("\n")
 	for _, line := range renderTimeline(rows) {
 		b.WriteString(line + "\n")
 	}
 	b.WriteString(substitute(r.Script.Summary, r.fields, r.Script.Fields) + "\n")
-
-	if explain {
-		b.WriteString("\nЧТО СМОТРЕТЬ\n")
-		for _, e := range r.Scene.Explain {
-			b.WriteString("  · " + substitute(e, r.fields, r.Script.Fields) + "\n")
-		}
-		b.WriteString("\nХРОНОМЕТРАЖ — сверка наблюдения со сценарием (в текст шага не копируется)\n")
-		for _, c := range chrono {
-			b.WriteString(c + "\n")
-		}
-	}
+	r.tail(&b, explain, chrono)
 
 	return b.String(), problems
 }

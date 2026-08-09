@@ -3,19 +3,26 @@ name: backend-architecture-lab
 # Один compose на весь курс: профили включаются по мере продвижения.
 # Студент никогда не поднимает всё сразу — в кадре только то, что уже введено.
 #
-#   mono   m01–m03   monolith, postgres, acquirer
+#   mono    m01–m03 l04   monolith, postgres, acquirer
+#   split   m03 l05–m04   + notifier: уведомления уехали за сеть
+#   net     m05           + toxiproxy: сеть можно рвать и замедлять
 #
-# Профили следующих модулей (split, net, broker, cdc, cluster, cache, scale,
-# trace, verify, trust) добавляются сюда по мере роста курса и не ломают
-# сцены предыдущих профилей.
+# Служба одна и та же во всех трёх профилях — меняется только то, где живёт
+# модуль уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же):
+# пусто — модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью,
+# которую сцена умеет портить.
+#
+# Профили следующих модулей (broker, cdc, cluster, cache, scale, trace,
+# verify, trust) добавляются сюда по мере роста курса и не ломают сцены
+# предыдущих профилей.
 
 services:
 
-  # ── профиль mono ────────────────────────────────────────────────────────
+  # ── служба доставки: во всех профилях одна ──────────────────────────────
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono]
+    profiles: [mono, split, net]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -45,7 +52,7 @@ services:
       context: ./services
       args:
         BIN: monolith
-    profiles: [mono]
+    profiles: [mono, split, net]
     environment:
       LAB_SERVICE: monolith
       LAB_ADDR: ":8080"
@@ -54,6 +61,13 @@ services:
       # Монолит ждёт эквайринг дольше, чем клиент ждёт монолит: именно из
       # этого зазора и вырастает сцена 1.
       LAB_ACQUIRER_TIMEOUT: 120s
+      # Пусто — уведомления живут в этом же процессе. Непусто — уехали за
+      # сеть. Значение подставляет `lab` по имени профиля.
+      LAB_NOTIFIER_URL: ${LAB_NOTIFIER_URL:-}
+    # Сцены m03 и m05 роняют службу намеренно — и то, что платформа поднимает
+    # её обратно, часть предмета: отказ здесь измеряется простоем, а не тем,
+    # что стенд остался сломанным.
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,7 +87,7 @@ services:
       context: ./services
       args:
         BIN: acquirer
-    profiles: [mono]
+    profiles: [mono, split, net]
     environment:
       LAB_SERVICE: acquirer
       LAB_ADDR: ":8090"
@@ -84,6 +98,42 @@ services:
       retries: 30
       start_period: 3s
     mem_limit: 128m
+
+  # ── профиль split: уведомления уехали за сеть ───────────────────────────
+
+  notifier:
+    image: ${LAB_REGISTRY}/notifier:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: notifier
+    profiles: [split, net]
+    environment:
+      LAB_SERVICE: notifier
+      LAB_ADDR: ":8070"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8070/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 128m
+
+  # ── профиль net: сеть, которую можно испортить ──────────────────────────
+  # Между монолитом и уведомлениями встаёт управляемый посредник: задержка,
+  # разрыв, обрыв на полуслове. Настраивает его сцена через API на 8474.
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: [net]
+    command: ["-host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    mem_limit: 64m
 
   # ── исполнитель сцен ────────────────────────────────────────────────────
   # Не сервис: поднимается на время одной сцены через `docker compose run`.
@@ -99,6 +149,8 @@ services:
     environment:
       LAB_MONOLITH_URL: http://monolith:8080
       LAB_ACQUIRER_URL: http://acquirer:8090
+      LAB_NOTIFIER_URL: http://notifier:8070
+      LAB_TOXIPROXY_URL: http://toxiproxy:8474
       LAB_SCENES_DIR: /lab/scenes
       LAB_PROFILE: ${LAB_PROFILE:-}
     volumes:

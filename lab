@@ -18,7 +18,18 @@ STATE_DIR="$LAB_DIR/.lab"
 PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
-KNOWN_PROFILES="mono"
+KNOWN_PROFILES="mono split net"
+
+# Где живёт модуль уведомлений в каждом профиле. Служба одна и та же — меняется
+# только это, и ровно из этого вырастают сцены m03 l05 и весь m05.
+notifier_url() {
+  case "$1" in
+    mono)  printf '' ;;                          # модуль внутри процесса
+    split) printf 'http://notifier:8070' ;;      # за сетью
+    net)   printf 'http://toxiproxy:8666' ;;     # за сетью, которую можно портить
+    *)     printf '' ;;
+  esac
+}
 
 say()  { printf '%s\n' "$*" >&2; }
 die()  { printf 'lab: %s\n' "$*" >&2; exit 2; }
@@ -69,7 +80,8 @@ remember_profile() {
 
 # labctl — исполнитель сцен. Поднимается на время одной команды и исчезает.
 labctl() {
-  LAB_PROFILE="$(current_profile)" \
+  local profile; profile="$(current_profile)"
+  LAB_PROFILE="$profile" LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
     compose --profile cli run --rm --no-deps -T labctl "$@"
 }
 
@@ -77,7 +89,9 @@ raise() {
   local profile="$1"
   known_profile "$profile"
   say "Поднимаю профиль $profile…"
-  compose --profile "$profile" up -d --wait >&2
+  # Смена профиля меняет окружение монолита — Compose пересоздаёт контейнер сам.
+  LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
+    compose --profile "$profile" up -d --wait >&2
   remember_profile "$profile"
 }
 
@@ -150,7 +164,10 @@ lab — стенд курса «Архитектура бэкенда: расп�
   ./lab pull [профиль]      обновить образы
   ./lab build               собрать образы локально (если GHCR недоступен)
 
-Профили: mono
+Профили:
+  mono    служба одним процессом: заказы, оплата, курьеры, уведомления
+  split   уведомления вынесены в отдельный сервис — тот же вызов, но по сети
+  net     то же самое плюс посредник, которому сцена портит сеть
 TXT
 }
 

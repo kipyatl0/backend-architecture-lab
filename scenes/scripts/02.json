@@ -1,0 +1,77 @@
+{
+  "id": "2",
+  "render": "table",
+
+  "config": {
+    "catalog_ms": 100,
+    "workers": 4,
+    "queue": 0,
+    "steps": [10, 20, 24, 28, 32, 36, 38, 40, 44],
+    "step_seconds": 12
+  },
+
+  "fields": {},
+
+  "header": [
+    "Служба: {{workers}} обработчика, каждый запрос занимает ровно {{service_ms}} мс",
+    "Значит потолок ровно {{capacity}} запросов в секунду — это арифметика, а не замер",
+    "Каждая ступень держится {{step_seconds}} с; p50 и p99 — со стороны клиента"
+  ],
+
+  "table": {
+    "columns": [
+      { "title": "Поток", "right": true },
+      { "title": "Утилизация", "right": true },
+      { "title": "p50", "right": true },
+      { "title": "p99", "right": true },
+      { "title": "Ждали в очереди", "right": true }
+    ],
+    "rows": [
+      { "key": "step#1", "cells": ["10 rps", "25%", "104 мс", "111 мс", "2"],
+        "checks": [{ "field": "p50_ms", "value": 104, "tol": 20 },
+                   { "field": "p99_ms", "value": 111, "tol": 40 },
+                   { "field": "queue_max", "value": 2, "tol": 6, "tol_pct": 70 }] },
+      { "key": "step#2", "cells": ["20 rps", "50%", "105 мс", "169 мс", "4"],
+        "checks": [{ "field": "p50_ms", "value": 105, "tol": 20 },
+                   { "field": "p99_ms", "value": 169, "tol": 60 },
+                   { "field": "queue_max", "value": 4, "tol": 6, "tol_pct": 70 }] },
+      { "key": "step#3", "cells": ["24 rps", "60%", "107 мс", "215 мс", "5"],
+        "checks": [{ "field": "p50_ms", "value": 107, "tol": 25 },
+                   { "field": "p99_ms", "value": 215, "tol_pct": 40 },
+                   { "field": "queue_max", "value": 5, "tol": 6, "tol_pct": 70 }] },
+      { "key": "step#4", "cells": ["28 rps", "70%", "122 мс", "307 мс", "9"],
+        "checks": [{ "field": "p50_ms", "value": 122, "tol": 40 },
+                   { "field": "p99_ms", "value": 307, "tol_pct": 40 },
+                   { "field": "queue_max", "value": 9, "tol": 6, "tol_pct": 70 }] },
+      { "key": "step#5", "cells": ["32 rps", "80%", "178 мс", "468 мс", "15"],
+        "checks": [{ "field": "p50_ms", "value": 178, "tol_pct": 45 },
+                   { "field": "p99_ms", "value": 468, "tol_pct": 45 },
+                   { "field": "queue_max", "value": 15, "tol": 8, "tol_pct": 70 }] },
+      { "key": "step#6", "cells": ["36 rps", "90%", "379 мс", "890 мс", "32"],
+        "checks": [{ "field": "p50_ms", "value": 379, "tol_pct": 55 },
+                   { "field": "p99_ms", "value": 890, "tol_pct": 50 },
+                   { "field": "queue_max", "value": 32, "tol": 10, "tol_pct": 70 }] },
+      { "key": "step#7", "cells": ["38 rps", "95%", "648 мс", "1117 мс", "42"],
+        "checks": [{ "field": "p50_ms", "value": 648, "tol_pct": 60 },
+                   { "field": "p99_ms", "value": 1117, "tol_pct": 55 },
+                   { "field": "queue_max", "value": 42, "tol": 12, "tol_pct": 70 }] },
+      { "key": "step#8", "cells": ["40 rps", "100%", "1010 мс", "1364 мс", "52"],
+        "checks": [{ "field": "p50_ms", "value": 1010, "tol_pct": 60 },
+                   { "field": "p99_ms", "value": 1364, "tol_pct": 60 },
+                   { "field": "queue_max", "value": 52, "tol": 15, "tol_pct": 70 }] },
+      { "key": "step#9", "cells": ["44 rps", "110%", "1709 мс", "2566 мс", "96"],
+        "checks": [{ "field": "p50_ms", "value": 1709, "tol_pct": 60 },
+                   { "field": "p99_ms", "value": 2566, "tol_pct": 60 },
+                   { "field": "queue_max", "value": 96, "tol": 20, "tol_pct": 70 }] }
+    ]
+  },
+
+  "summary": "ИТОГ: поток вырос в 4,4 раза, p99 — в 23 раза; и почти весь этот рост случился после отметки в 70% потолка",
+
+  "legend": [
+    "«Ждали в очереди» — сколько запросов одновременно стояло перед обработчиками в пике ступени.",
+    "Очередь никто не заводил и нигде не настраивал: она возникает сама, как только поток встречается с ограниченной ёмкостью.",
+    "Промежутки между запросами не равные, а случайные — клиенты друг с другом не сговариваются. Очередь берётся именно из этого разброса: при идеально ровном потоке её не было бы вовсе до самого потолка.",
+    "Накладные расходы стенда добавляют к каждому запросу 3–4 мс, поэтому настоящий потолок чуть ниже расчётного — около 38 rps. Ровно поэтому на ступени «100%» служба уже в долгу."
+  ]
+}

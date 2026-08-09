@@ -1,0 +1,55 @@
+{
+  "id": "4",
+
+  "config": {
+    "amount": 1890,
+    "client": "Ирина",
+    "restaurant": "Пекарня «Батон»",
+    "first_order_id": 7714
+  },
+
+  "fields": {},
+
+  "header": [
+    "Подготовка: состояние сброшено, следующий заказ {{first_order}}, эквайринг отвечает сразу",
+    "Два независимых сценария: заказ и просмотр каталога ресторанов",
+    "В модуле уведомлений — ошибка, до которой никому не было дела"
+  ],
+
+  "timeline": [
+    { "key": "catalog.ok#1", "at": 0.000, "tol": 2.0,
+      "from": "client", "arrow": "←", "to": "orders",
+      "detail": "200 OK GET /catalog — каталог отвечает" },
+
+    { "key": "orders.ok#1", "at": 0.020, "tol": 2.0,
+      "from": "client", "arrow": "←", "to": "orders",
+      "detail": "201 Created {order: {{first_order}}} — заказ проходит" },
+
+    { "key": "bug.armed", "at": 0.025, "tol": 2.0,
+      "from": "orders", "arrow": "⋯", "to": "orders",
+      "detail": "в модуле уведомлений ошибка", "note": "ждёт своего заказа" },
+
+    { "key": "orders.crash", "at": 2.000, "tol": 2.5,
+      "from": "client", "arrow": "→", "to": "orders",
+      "detail": "POST /orders — заказ доходит до модуля уведомлений" },
+
+    { "key": "catalog.down", "at": 2.070, "tol": 3.0,
+      "from": "client", "arrow": "✗", "to": "orders",
+      "detail": "GET /catalog — соединение отвергнуто", "note": "процесса больше нет" },
+
+    { "key": "orders.down", "at": 2.071, "tol": 3.0,
+      "from": "client", "arrow": "✗", "to": "orders",
+      "detail": "POST /orders — соединение отвергнуто" },
+
+    { "key": "catalog.back", "at": 2.300, "tol": 10.0,
+      "from": "client", "arrow": "←", "to": "orders",
+      "detail": "200 OK GET /catalog — платформа подняла процесс заново" }
+  ],
+
+  "summary": "ИТОГ: сломан один модуль из четырёх, не отвечало всё; заказ, на котором процесс умер, не сохранился — в базе остался {{orders_left}} заказ",
+
+  "legend": [
+    "Каталог ресторанов не обращается к уведомлениям ни одной строчкой — и всё равно лёг вместе с ними.",
+    "Радиус отказа здесь равен процессу, а процесс равен всей службе."
+  ]
+}

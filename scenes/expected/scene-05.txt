@@ -1,0 +1,26 @@
+Сцена 5 · m03 l05 · профиль split · детерминирована
+Уведомления вынесены в сервис
+Подготовка: состояние сброшено, следующий заказ 7714, эквайринг отвечает сразу
+Уведомления больше не модуль этого процесса: они за сетью, и вызов к ним — сетевой
+Таймаут вызова уведомлений — 2s, повторов нет
+
+t=0.000  client    → orders     POST /orders {amount: 1890}
+t=0.002  orders    → payments   POST /charge {order: 7714, amount: 1890}
+t=0.003  payments  ⋯ acquirer   POST /v1/charge
+t=0.005  payments  ← acquirer   200 OK {charge: ch_1}
+t=0.007  orders    → notifier   POST /notifications {order: 7714}  вчера это был вызов функции
+t=0.010  orders    ← notifier   200 OK {id: n_1}
+t=0.012  orders    ← payments   заказ 7714 → paid, курьер Пётр, транзакция зафиксирована
+t=0.014  client    ← orders     201 Created {order: 7714} — заказ принят целиком
+t=0.020  notifier  ⋯ notifier   сервис перестал отвечать          не упал — именно молчит
+t=2.000  client    → orders     POST /orders {amount: 1890}
+t=2.002  orders    → payments   POST /charge {order: 7715, amount: 1890}
+t=2.003  payments  ⋯ acquirer   POST /v1/charge
+t=2.005  payments  ← acquirer   200 OK {charge: ch_2}             деньги списаны по-настоящему
+t=2.007  orders    → notifier   POST /notifications {order: 7715}
+t=4.008  orders    ✗ notifier   таймаут вызова (2s), исход НЕИЗВЕСТЕН
+t=4.010  client    ← orders     502 — транзакция откачена, заказа в базе нет
+ИТОГ: заказов в базе 1, списаний у эквайринга 2 на 3780, уведомлений доставлено 1
+
+Второй заказ откатился транзакцией: строки в базе нет. Списание откатить было нечем — эквайринг про транзакцию службы не знает.
+Клиент увидел ошибку и заплатил. Внутри одного процесса такого исхода не существовало: там откат отменял всё сразу.

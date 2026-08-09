@@ -1,0 +1,95 @@
+{
+  "id": "5",
+
+  "config": {
+    "amount": 1890,
+    "client": "Ирина",
+    "restaurant": "Пекарня «Батон»",
+    "first_order_id": 7714,
+    "notify_timeout_ms": 2000,
+    "retry_at_s": 2.0
+  },
+
+  "fields": {},
+
+  "header": [
+    "Подготовка: состояние сброшено, следующий заказ {{first_order}}, эквайринг отвечает сразу",
+    "Уведомления больше не модуль этого процесса: они за сетью, и вызов к ним — сетевой",
+    "Таймаут вызова уведомлений — {{notify_timeout}}, повторов нет"
+  ],
+
+  "ignore": ["orders.reply#1"],
+
+  "timeline": [
+    { "key": "client.call.orders#1", "at": 0.000, "tol": 1.5,
+      "from": "client", "arrow": "→", "to": "orders",
+      "detail": "POST /orders {amount: {{amount}}}" },
+
+    { "key": "orders.call.payments#1", "at": 0.002, "tol": 1.5,
+      "from": "orders", "arrow": "→", "to": "payments",
+      "detail": "POST /charge {order: {{first_order}}, amount: {{amount}}}" },
+
+    { "key": "payments.wait.acquirer#1", "at": 0.003, "tol": 1.5,
+      "from": "payments", "arrow": "⋯", "to": "acquirer",
+      "detail": "POST /v1/charge" },
+
+    { "key": "payments.recv.acquirer#1", "at": 0.005, "tol": 1.5,
+      "from": "payments", "arrow": "←", "to": "acquirer",
+      "detail": "200 OK {charge: ch_1}" },
+
+    { "key": "orders.call.notifier#1.1", "at": 0.007, "tol": 1.5,
+      "from": "orders", "arrow": "→", "to": "notifier",
+      "detail": "POST /notifications {order: {{first_order}}}", "note": "вчера это был вызов функции" },
+
+    { "key": "orders.recv.notifier#1.1", "at": 0.010, "tol": 1.5,
+      "from": "orders", "arrow": "←", "to": "notifier",
+      "detail": "200 OK {id: n_1}" },
+
+    { "key": "orders.recv.payments#1", "at": 0.012, "tol": 1.5,
+      "from": "orders", "arrow": "←", "to": "payments",
+      "detail": "заказ {{first_order}} → paid, курьер Пётр, транзакция зафиксирована" },
+
+    { "key": "client.recv#1", "at": 0.014, "tol": 1.5,
+      "from": "client", "arrow": "←", "to": "orders",
+      "detail": "201 Created {order: {{first_order}}} — заказ принят целиком" },
+
+    { "key": "notifier.hang", "at": 0.020, "tol": 1.5,
+      "from": "notifier", "arrow": "⋯", "to": "notifier",
+      "detail": "сервис перестал отвечать", "note": "не упал — именно молчит" },
+
+    { "key": "client.call.orders#2", "at": 2.000, "tol": 1.5,
+      "from": "client", "arrow": "→", "to": "orders",
+      "detail": "POST /orders {amount: {{amount}}}" },
+
+    { "key": "orders.call.payments#2", "at": 2.002, "tol": 1.5,
+      "from": "orders", "arrow": "→", "to": "payments",
+      "detail": "POST /charge {order: {{second_order}}, amount: {{amount}}}" },
+
+    { "key": "payments.wait.acquirer#2", "at": 2.003, "tol": 1.5,
+      "from": "payments", "arrow": "⋯", "to": "acquirer",
+      "detail": "POST /v1/charge" },
+
+    { "key": "payments.recv.acquirer#2", "at": 2.005, "tol": 1.5,
+      "from": "payments", "arrow": "←", "to": "acquirer",
+      "detail": "200 OK {charge: ch_2}", "note": "деньги списаны по-настоящему" },
+
+    { "key": "orders.call.notifier#2.1", "at": 2.007, "tol": 1.5,
+      "from": "orders", "arrow": "→", "to": "notifier",
+      "detail": "POST /notifications {order: {{second_order}}}" },
+
+    { "key": "orders.fail.notifier#2.1", "at": 4.008, "tol": 2.0,
+      "from": "orders", "arrow": "✗", "to": "notifier",
+      "detail": "таймаут вызова ({{notify_timeout}}), исход НЕИЗВЕСТЕН" },
+
+    { "key": "client.fail#2", "at": 4.010, "tol": 2.0,
+      "from": "client", "arrow": "←", "to": "orders",
+      "detail": "502 — транзакция откачена, заказа в базе нет" }
+  ],
+
+  "summary": "ИТОГ: заказов в базе {{orders}}, списаний у эквайринга {{charges}} на {{charged_total}}, уведомлений доставлено {{notifications}}",
+
+  "legend": [
+    "Второй заказ откатился транзакцией: строки в базе нет. Списание откатить было нечем — эквайринг про транзакцию службы не знает.",
+    "Клиент увидел ошибку и заплатил. Внутри одного процесса такого исхода не существовало: там откат отменял всё сразу."
+  ]
+}

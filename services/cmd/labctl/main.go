@@ -16,6 +16,17 @@ import (
 // Драйверы сцен: реестр сцен — данные, поведение — здесь.
 var drivers = map[string]func(context.Context, *Run) error{
 	"scene01": scene01,
+	"scene02": scene02,
+	"scene03": scene03,
+	"scene04": scene04,
+	"scene05": scene05,
+	"scene06": scene06,
+	"scene07": scene07,
+	"scene08": scene08,
+	"scene09": scene09,
+	"scene10": scene10,
+	"scene11": scene11,
+	"scene12": scene12,
 }
 
 func main() {
