@@ -14,7 +14,7 @@ services:
   # ── профиль mono ────────────────────────────────────────────────────────
 
   postgres:
-    image: postgres:17.6-alpine
+    image: postgres:18.4-alpine
     profiles: [mono]
     environment:
       POSTGRES_USER: delivery
@@ -26,7 +26,11 @@ services:
     command: >
       postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # С 18 официальный образ держит данные в /var/lib/postgresql/<мажор>/docker,
+      # а томом объявляет /var/lib/postgresql — монтируем именно его. При смене
+      # мажорной версии этот путь надо проверять заново: со старым
+      # /var/lib/postgresql/data том оказался бы мимо данных.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U delivery -d delivery"]
       interval: 2s

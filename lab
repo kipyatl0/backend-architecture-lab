@@ -15,6 +15,7 @@ set -euo pipefail
 
 LAB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$LAB_DIR/.lab"
+PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
 KNOWN_PROFILES="mono"
@@ -24,6 +25,25 @@ die()  { printf 'lab: %s\n' "$*" >&2; exit 2; }
 
 compose() {
   docker compose --project-directory "$LAB_DIR" -f "$LAB_DIR/docker-compose.yml" "$@"
+}
+
+# Compose видит сервис — а с ним и его том — только когда включён профиль
+# этого сервиса. Поэтому down и reset включают все профили стенда разом:
+# иначе `down -v` тихо не удаляет ничего, и reset оставляет старые данные.
+compose_all() {
+  local args=()
+  for p in $KNOWN_PROFILES cli; do args+=(--profile "$p"); done
+  compose "${args[@]}" "$@"
+}
+
+# Страховка от той же ошибки с другой стороны: что бы ни решил Compose,
+# после reset томов проекта остаться не должно.
+purge_volumes() {
+  local left
+  left="$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)"
+  [ -n "$left" ] || return 0
+  # shellcheck disable=SC2086
+  docker volume rm $left >/dev/null 2>&1 || true
 }
 
 require_docker() {
@@ -70,14 +90,15 @@ cmd_up() {
 
 cmd_down() {
   say "Останавливаю стенд (тома остаются)…"
-  compose down --remove-orphans >&2
+  compose_all down --remove-orphans >&2
 }
 
 cmd_reset() {
   local profile="${1:-$(current_profile)}"
   [ -n "$profile" ] || die "укажи профиль: ./lab reset mono"
   say "Сбрасываю состояние: тома пересоздаются…"
-  compose down -v --remove-orphans >&2
+  compose_all down -v --remove-orphans >&2
+  purge_volumes
   raise "$profile"
   say "Готово: данные в исходном состоянии."
 }
