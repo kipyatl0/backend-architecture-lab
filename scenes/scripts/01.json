@@ -1,0 +1,82 @@
+{
+  "id": "1",
+
+  "config": {
+    "acquirer_delay_ms": 30000,
+    "acquirer_mode": "ok",
+    "idempotent": false,
+    "amount": 1890,
+    "client": "Ирина",
+    "restaurant": "Пекарня «Батон»",
+    "first_order_id": 7714,
+    "client_timeout_ms": 5000,
+    "retry_at_s": 5.001
+  },
+
+  "fields": {},
+
+  "header": [
+    "Подготовка: состояние сброшено, следующий заказ {{first_order}}, эквайринг отвечает через {{delay}}",
+    "Клиент ждёт ответа {{client_timeout}} и делает один повтор"
+  ],
+
+  "timeline": [
+    { "key": "client.call.orders#1",     "at": 0.000,  "tol": 1.0,
+      "from": "client",   "arrow": "→", "to": "orders",
+      "detail": "POST /orders {idempotency_key: none}" },
+
+    { "key": "orders.call.payments#1",   "at": 0.004,  "tol": 1.5,
+      "from": "orders",   "arrow": "→", "to": "payments",
+      "detail": "POST /charge {order: {{order}}, amount: {{amount}}}" },
+
+    { "key": "payments.wait.acquirer#1", "at": 0.005,  "tol": 1.5,
+      "from": "payments", "arrow": "⋯", "to": "acquirer",
+      "detail": "POST /v1/charge", "note": "[задержка {{delay}}]" },
+
+    { "key": "client.timeout#1",         "at": 5.000,  "tol": 1.0,
+      "from": "client",   "arrow": "✗", "to": "orders",
+      "detail": "таймаут клиента ({{client_timeout}}), исход НЕИЗВЕСТЕН" },
+
+    { "key": "client.call.orders#2",     "at": 5.001,  "tol": 1.0,
+      "from": "client",   "arrow": "→", "to": "orders",
+      "detail": "POST /orders (повтор)" },
+
+    { "key": "orders.call.payments#2",   "at": 5.005,  "tol": 1.5,
+      "from": "orders",   "arrow": "→", "to": "payments",
+      "detail": "POST /charge {order: {{order}}, amount: {{amount}}}" },
+
+    { "key": "payments.wait.acquirer#2", "at": 5.006,  "tol": 1.5,
+      "from": "payments", "arrow": "⋯", "to": "acquirer",
+      "detail": "POST /v1/charge", "note": "[задержка {{delay}}]" },
+
+    { "key": "client.timeout#2",         "at": 10.001, "tol": 1.0,
+      "from": "client",   "arrow": "✗", "to": "orders",
+      "detail": "таймаут клиента ({{client_timeout}}), повторов больше нет" },
+
+    { "key": "payments.recv.acquirer#1", "at": 30.005, "tol": 2.0,
+      "from": "payments", "arrow": "←", "to": "acquirer",
+      "detail": "200 OK {charge: {{charge}}}", "note": "← первая попытка ЖИВА" },
+
+    { "key": "orders.recv.payments#1",   "at": 30.007, "tol": 2.0,
+      "from": "orders",   "arrow": "←", "to": "payments",
+      "detail": "заказ {{order}} → paid, курьер {{courier}}, уведомление отправлено" },
+
+    { "key": "orders.lost#1",            "at": 30.008, "tol": 2.0,
+      "from": "orders",   "arrow": "✗", "to": "client",
+      "detail": "201 Created {order: {{order}}} отдать некому: соединение закрыто" },
+
+    { "key": "payments.recv.acquirer#2", "at": 35.006, "tol": 2.0,
+      "from": "payments", "arrow": "←", "to": "acquirer",
+      "detail": "200 OK {charge: {{charge}}}" },
+
+    { "key": "orders.recv.payments#2",   "at": 35.008, "tol": 2.0,
+      "from": "orders",   "arrow": "←", "to": "payments",
+      "detail": "заказ {{order}} → paid, курьер {{courier}}, уведомление отправлено" },
+
+    { "key": "orders.lost#2",            "at": 35.009, "tol": 2.0,
+      "from": "orders",   "arrow": "✗", "to": "client",
+      "detail": "201 Created {order: {{order}}} отдать некому: соединение закрыто" }
+  ],
+
+  "summary": "ИТОГ: заказов {{orders}}, списаний {{charges}}, клиент заплатил {{charged_total}} вместо {{amount}} и на экране увидел ошибку"
+}

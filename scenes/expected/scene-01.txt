@@ -1,0 +1,20 @@
+Сцена 1 · m01 l04 · профиль mono · детерминирована
+Провайдер отвечает 30 с, клиент повторяет
+Подготовка: состояние сброшено, следующий заказ 7714, эквайринг отвечает через 30s
+Клиент ждёт ответа 5s и делает один повтор
+
+t=0.000  client    → orders     POST /orders {idempotency_key: none}
+t=0.004  orders    → payments   POST /charge {order: 7714, amount: 1890}
+t=0.005  payments  ⋯ acquirer   POST /v1/charge             [задержка 30s]
+t=5.000  client    ✗ orders     таймаут клиента (5s), исход НЕИЗВЕСТЕН
+t=5.001  client    → orders     POST /orders (повтор)
+t=5.005  orders    → payments   POST /charge {order: 7715, amount: 1890}
+t=5.006  payments  ⋯ acquirer   POST /v1/charge             [задержка 30s]
+t=10.001 client    ✗ orders     таймаут клиента (5s), повторов больше нет
+t=30.005 payments  ← acquirer   200 OK {charge: ch_1}       ← первая попытка ЖИВА
+t=30.007 orders    ← payments   заказ 7714 → paid, курьер Пётр, уведомление отправлено
+t=30.008 orders    ✗ client     201 Created {order: 7714} отдать некому: соединение закрыто
+t=35.006 payments  ← acquirer   200 OK {charge: ch_2}
+t=35.008 orders    ← payments   заказ 7715 → paid, курьер Никита, уведомление отправлено
+t=35.009 orders    ✗ client     201 Created {order: 7715} отдать некому: соединение закрыто
+ИТОГ: заказов 2, списаний 2, клиент заплатил 3780 вместо 1890 и на экране увидел ошибку

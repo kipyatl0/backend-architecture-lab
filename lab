@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+#
+# lab — единственная команда стенда. Одна сцена = одна команда: студент не
+# пишет `docker compose exec … && curl …` руками, это порог, а не обучение.
+#
+# Единственная зависимость — Docker. Ни make, ни языковых рантаймов, ни
+# установки пакетов. Работает на macOS, Linux и WSL; путь к репозиторию
+# значения не имеет.
+#
+# Договорённость про потоки: в stdout уходит ТОЛЬКО вывод сцены — его
+# копируют в текст шага как есть. Всё служебное (что поднимаем, что тянем) —
+# в stderr.
+
+set -euo pipefail
+
+LAB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$LAB_DIR/.lab"
+
+# Профили Compose, известные стенду. Пополняется вместе с курсом.
+KNOWN_PROFILES="mono"
+
+say()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'lab: %s\n' "$*" >&2; exit 2; }
+
+compose() {
+  docker compose --project-directory "$LAB_DIR" -f "$LAB_DIR/docker-compose.yml" "$@"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "не найден docker — стенду нужен только он"
+  docker info >/dev/null 2>&1 || die "docker установлен, но не запущен — запусти Docker и повтори"
+}
+
+known_profile() {
+  for p in $KNOWN_PROFILES; do
+    [ "$p" = "$1" ] && return 0
+  done
+  die "профиль «$1» не знаком; есть: $KNOWN_PROFILES"
+}
+
+current_profile() {
+  [ -f "$STATE_DIR/profile" ] && cat "$STATE_DIR/profile" || true
+}
+
+remember_profile() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$1" > "$STATE_DIR/profile"
+}
+
+# labctl — исполнитель сцен. Поднимается на время одной команды и исчезает.
+labctl() {
+  LAB_PROFILE="$(current_profile)" \
+    compose --profile cli run --rm --no-deps -T labctl "$@"
+}
+
+raise() {
+  local profile="$1"
+  known_profile "$profile"
+  say "Поднимаю профиль $profile…"
+  compose --profile "$profile" up -d --wait >&2
+  remember_profile "$profile"
+}
+
+cmd_up() {
+  local profile="${1:-}"
+  [ -n "$profile" ] || die "укажи профиль: ./lab up mono"
+  raise "$profile"
+  say "Готово. Сцены профиля: ./lab scenes"
+}
+
+cmd_down() {
+  say "Останавливаю стенд (тома остаются)…"
+  compose down --remove-orphans >&2
+}
+
+cmd_reset() {
+  local profile="${1:-$(current_profile)}"
+  [ -n "$profile" ] || die "укажи профиль: ./lab reset mono"
+  say "Сбрасываю состояние: тома пересоздаются…"
+  compose down -v --remove-orphans >&2
+  raise "$profile"
+  say "Готово: данные в исходном состоянии."
+}
+
+cmd_scene() {
+  [ $# -gt 0 ] || die "укажи номер сцены: ./lab scene 1"
+  local id="$1"; shift
+  local profile
+  profile="$(labctl profile "$id")"
+  raise "$profile"
+  labctl scene "$id" "$@"
+}
+
+cmd_scenes() { labctl scenes; }
+cmd_state()  { labctl state; }
+
+cmd_logs() {
+  [ $# -gt 0 ] || die "укажи сервис: ./lab logs monolith"
+  compose logs --no-log-prefix "$@"
+}
+
+cmd_build() {
+  say "Собираю образы стенда локально (запасной путь: обычно они тянутся из GHCR)…"
+  local args=()
+  for p in $KNOWN_PROFILES; do args+=(--profile "$p"); done
+  compose "${args[@]}" --profile cli build >&2
+}
+
+cmd_pull() {
+  local profile="${1:-$(current_profile)}"
+  [ -n "$profile" ] || profile="mono"
+  known_profile "$profile"
+  compose --profile "$profile" --profile cli pull >&2
+}
+
+cmd_help() {
+  cat >&2 <<'TXT'
+lab — стенд курса «Архитектура бэкенда: распределённые системы и системный дизайн»
+
+  ./lab scene <id>          прогнать сцену и напечатать timeline
+  ./lab scene <id> --explain  то же + пояснение, что именно смотреть
+  ./lab scenes              список сцен текущего профиля
+  ./lab state               текущее состояние данных: заказы, платежи, уведомления
+
+  ./lab up <профиль>        поднять профиль (сцена поднимает свой профиль сама)
+  ./lab down                остановить, тома оставить
+  ./lab reset [профиль]     вернуть исходное состояние данных, тома пересоздать
+  ./lab logs <сервис>       структурированный лог сервиса
+  ./lab pull [профиль]      обновить образы
+  ./lab build               собрать образы локально (если GHCR недоступен)
+
+Профили: mono
+TXT
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    up)     require_docker; cmd_up "$@" ;;
+    down)   require_docker; cmd_down "$@" ;;
+    reset)  require_docker; cmd_reset "$@" ;;
+    scene)  require_docker; cmd_scene "$@" ;;
+    scenes) require_docker; cmd_scenes "$@" ;;
+    state)  require_docker; cmd_state "$@" ;;
+    logs)   require_docker; cmd_logs "$@" ;;
+    build)  require_docker; cmd_build "$@" ;;
+    pull)   require_docker; cmd_pull "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)      die "неизвестная команда «$cmd»; ./lab help — список" ;;
+  esac
+}
+
+main "$@"

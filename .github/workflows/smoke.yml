@@ -1,0 +1,33 @@
+name: smoke
+
+# Смоук на каждый пуш: все сцены с эталонным выводом прогоняются и сверяются
+# посимвольно. Расхождение = сломанный шаг курса.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  scenes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: собрать образы локально
+        run: ./lab build
+
+      - name: прогнать сцены и сверить с эталоном
+        run: ./scripts/smoke.sh
+
+      - name: логи сервисов при провале
+        if: failure()
+        run: |
+          ./lab logs monolith || true
+          ./lab logs acquirer || true
+
+      - name: погасить стенд
+        if: always()
+        run: ./lab down || true

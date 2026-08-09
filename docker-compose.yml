@@ -1,0 +1,106 @@
+name: backend-architecture-lab
+
+# Один compose на весь курс: профили включаются по мере продвижения.
+# Студент никогда не поднимает всё сразу — в кадре только то, что уже введено.
+#
+#   mono   m01–m03   monolith, postgres, acquirer
+#
+# Профили следующих модулей (split, net, broker, cdc, cluster, cache, scale,
+# trace, verify, trust) добавляются сюда по мере роста курса и не ломают
+# сцены предыдущих профилей.
+
+services:
+
+  # ── профиль mono ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:17.6-alpine
+    profiles: [mono]
+    environment:
+      POSTGRES_USER: delivery
+      POSTGRES_PASSWORD: delivery
+      POSTGRES_DB: delivery
+      # Сцены курса измеряются секундами, а не миллисекундами: fsync ничего
+      # не доказывает, зато заметно шумит на ноутбуке.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U delivery -d delivery"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    mem_limit: 512m
+
+  monolith:
+    image: ${LAB_REGISTRY}/monolith:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: monolith
+    profiles: [mono]
+    environment:
+      LAB_SERVICE: monolith
+      LAB_ADDR: ":8080"
+      LAB_DATABASE_URL: postgres://delivery:delivery@postgres:5432/delivery?sslmode=disable
+      LAB_ACQUIRER_URL: http://acquirer:8090
+      # Монолит ждёт эквайринг дольше, чем клиент ждёт монолит: именно из
+      # этого зазора и вырастает сцена 1.
+      LAB_ACQUIRER_TIMEOUT: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      acquirer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 256m
+
+  acquirer:
+    image: ${LAB_REGISTRY}/acquirer:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: acquirer
+    profiles: [mono]
+    environment:
+      LAB_SERVICE: acquirer
+      LAB_ADDR: ":8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 128m
+
+  # ── исполнитель сцен ────────────────────────────────────────────────────
+  # Не сервис: поднимается на время одной сцены через `docker compose run`.
+  # Живёт в своём профиле, чтобы `lab up <профиль>` его не запускал.
+
+  labctl:
+    image: ${LAB_REGISTRY}/labctl:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: labctl
+    profiles: [cli]
+    environment:
+      LAB_MONOLITH_URL: http://monolith:8080
+      LAB_ACQUIRER_URL: http://acquirer:8090
+      LAB_SCENES_DIR: /lab/scenes
+      LAB_PROFILE: ${LAB_PROFILE:-}
+    volumes:
+      # Реестр сцен — данные, а не код: правка сцены не требует пересборки.
+      - ./scenes:/lab/scenes:ro
+    mem_limit: 128m
+
+volumes:
+  pgdata:

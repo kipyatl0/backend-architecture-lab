@@ -1,0 +1,53 @@
+name: images
+
+# Образы курса едут в GHCR: студент клонирует репозиторий и получает
+# работающий стенд без сборки. Локальная сборка (./lab build) — запасной путь.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - '.env'
+      - '.github/workflows/images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bin: [monolith, acquirer, labctl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: версия из .env
+        id: version
+        run: |
+          version="$(grep '^LAB_VERSION=' .env | cut -d= -f2)"
+          [ -n "$version" ] || { echo "LAB_VERSION не найден в .env"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./services
+          build-args: BIN=${{ matrix.bin }}
+          # Студенты приходят и на amd64, и на arm64 — образ обязан работать у обоих.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository }}/${{ matrix.bin }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
