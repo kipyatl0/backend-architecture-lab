@@ -1,66 +1,208 @@
 {
   "id": "11",
   "render": "table",
-
   "config": {
     "workers": 4,
     "catalog_ms": 100,
     "queue": 100,
     "rps": 80,
     "seconds": 12,
-    "slices": [3, 6, 9, 12]
+    "slices": [
+      3,
+      6,
+      9,
+      12
+    ]
   },
-
   "fields": {},
-
   "header": [
     "Потолок службы — {{capacity}} запросов в секунду ({{workers}} обработчика по {{service_ms}} мс)",
     "Подаём {{rps}} rps: вдвое больше, чем служба способна обслужить, и держим {{seconds}} с",
     "Два прогона подряд: очередь без границы и очередь с границей в {{queue_limit}} мест"
   ],
-
   "table": {
     "columns": [
-      { "title": "Секунда", "right": true },
-      { "title": "В очереди", "right": true },
-      { "title": "Горутин", "right": true },
-      { "title": "Память", "right": true }
+      {
+        "title": "Секунда",
+        "right": true
+      },
+      {
+        "title": "В очереди",
+        "right": true
+      },
+      {
+        "title": "Задач в работе",
+        "right": true
+      },
+      {
+        "title": "Память",
+        "right": true
+      }
     ],
     "rows": [
-      { "key": "free#3", "cells": ["3 с", "151", "321", "9,6 МБ"],
-        "checks": [{ "field": "waiting", "value": 151, "tol_pct": 40 },
-                   { "field": "goroutines", "value": 321, "tol_pct": 40 },
-                   { "field": "heap_mb", "value": 9.6, "tol": 8 }] },
-      { "key": "free#6", "cells": ["6 с", "266", "547", "10,2 МБ"],
-        "checks": [{ "field": "waiting", "value": 266, "tol_pct": 40 },
-                   { "field": "goroutines", "value": 547, "tol_pct": 40 },
-                   { "field": "heap_mb", "value": 10.2, "tol": 8 }] },
-      { "key": "free#9", "cells": ["9 с", "371", "760", "10,9 МБ"],
-        "checks": [{ "field": "waiting", "value": 371, "tol_pct": 40 },
-                   { "field": "goroutines", "value": 760, "tol_pct": 40 },
-                   { "field": "heap_mb", "value": 10.9, "tol": 8 }] },
-      { "key": "free#12", "cells": ["12 с", "480", "977", "11,5 МБ"],
-        "checks": [{ "field": "waiting", "value": 480, "tol_pct": 40 },
-                   { "field": "goroutines", "value": 977, "tol_pct": 40 },
-                   { "field": "heap_mb", "value": 11.5, "tol": 8 }] },
-      { "key": "free.total", "rule": true,
-        "cells": ["без границы", "отказов 0", "ответов 949", "p99 12 600 мс"],
-        "checks": [{ "field": "rejected", "value": 0, "tol": 3 },
-                   { "field": "ok", "value": 949, "tol_pct": 25 },
-                   { "field": "p99_ms", "value": 12600, "tol_pct": 40 }] },
-      { "key": "bound.total",
-        "cells": ["с границей в 100 мест", "отказов 385", "ответов 564", "p99 2700 мс"],
-        "checks": [{ "field": "rejected", "value": 385, "tol_pct": 40 },
-                   { "field": "ok", "value": 564, "tol_pct": 30 },
-                   { "field": "p99_ms", "value": 2700, "tol_pct": 40 }] }
+      {
+        "key": "free#3",
+        "cells": [
+          "3 с",
+          "151",
+          "321",
+          "9,6 МБ"
+        ],
+        "checks": [
+          {
+            "field": "waiting",
+            "value": 151,
+            "tol_pct": 40
+          },
+          {
+            "field": "goroutines",
+            "value": 321,
+            "tol_pct": 40
+          },
+          {
+            "field": "heap_mb",
+            "value": 9.6,
+            "tol": 8
+          }
+        ]
+      },
+      {
+        "key": "free#6",
+        "cells": [
+          "6 с",
+          "266",
+          "547",
+          "10,2 МБ"
+        ],
+        "checks": [
+          {
+            "field": "waiting",
+            "value": 266,
+            "tol_pct": 40
+          },
+          {
+            "field": "goroutines",
+            "value": 547,
+            "tol_pct": 40
+          },
+          {
+            "field": "heap_mb",
+            "value": 10.2,
+            "tol": 8
+          }
+        ]
+      },
+      {
+        "key": "free#9",
+        "cells": [
+          "9 с",
+          "371",
+          "760",
+          "10,9 МБ"
+        ],
+        "checks": [
+          {
+            "field": "waiting",
+            "value": 371,
+            "tol_pct": 40
+          },
+          {
+            "field": "goroutines",
+            "value": 760,
+            "tol_pct": 40
+          },
+          {
+            "field": "heap_mb",
+            "value": 10.9,
+            "tol": 8
+          }
+        ]
+      },
+      {
+        "key": "free#12",
+        "cells": [
+          "12 с",
+          "480",
+          "977",
+          "11,5 МБ"
+        ],
+        "checks": [
+          {
+            "field": "waiting",
+            "value": 480,
+            "tol_pct": 40
+          },
+          {
+            "field": "goroutines",
+            "value": 977,
+            "tol_pct": 40
+          },
+          {
+            "field": "heap_mb",
+            "value": 11.5,
+            "tol": 8
+          }
+        ]
+      },
+      {
+        "key": "free.total",
+        "rule": true,
+        "cells": [
+          "без границы",
+          "отказов 0",
+          "ответов 949",
+          "p99 12 600 мс"
+        ],
+        "checks": [
+          {
+            "field": "rejected",
+            "value": 0,
+            "tol": 3
+          },
+          {
+            "field": "ok",
+            "value": 949,
+            "tol_pct": 25
+          },
+          {
+            "field": "p99_ms",
+            "value": 12600,
+            "tol_pct": 40
+          }
+        ]
+      },
+      {
+        "key": "bound.total",
+        "cells": [
+          "с границей в 100 мест",
+          "отказов 385",
+          "ответов 564",
+          "p99 2700 мс"
+        ],
+        "checks": [
+          {
+            "field": "rejected",
+            "value": 385,
+            "tol_pct": 40
+          },
+          {
+            "field": "ok",
+            "value": 564,
+            "tol_pct": 30
+          },
+          {
+            "field": "p99_ms",
+            "value": 2700,
+            "tol_pct": 40
+          }
+        ]
+      }
     ]
   },
-
   "summary": "ИТОГ: без границы не отказали никому — и заставили последних ждать 12,6 с; с границей отказали трети сразу, а остальным ответили в четыре с половиной раза быстрее",
-
   "legend": [
     "Верхние четыре строки — один прогон в разные секунды. Очередь растёт ровно на 40 запросов в секунду: столько служба не успевает.",
-    "Каждый ждущий запрос — это горутина и её буферы. За 12 с их стало 977, и ничто в системе не собирается это останавливать.",
+    "Каждый ждущий запрос — это задача и её буферы. За 12 с их стало 977, и ничто в системе не собирается это останавливать.",
     "Память растёт медленно и незаметно: два мегабайта за двенадцать секунд. Именно поэтому такая перегрузка не видна в мониторинге до самого конца.",
     "Пропускная способность в обоих прогонах одинаковая — она задана числом обработчиков, а не длиной очереди. Очередь решает только одно: узнает клиент об отказе через 3 мс или через 12 секунд."
   ]
