@@ -37,6 +37,15 @@ const (
 	TopicParts = 3               // партиций у лога: порядок живёт внутри партиции
 )
 
+// Журнал изменений базы (профиль cdc, m07 l03). Имена видит студент — в теме,
+// в списке слотов репликации и в тексте шага, — поэтому живут здесь.
+const (
+	CDCPrefix      = "cdc"               // префикс тем, он же логическое имя сервера
+	TopicCDC       = "cdc.public.orders" // <префикс>.<схема>.<таблица> — имя даёт не приложение
+	CDCSlot        = "lab_orders"        // слот репликации: место, с которого читают журнал
+	CDCPublication = "lab_orders_pub"    // публикация: какие таблицы попадают в поток
+)
+
 // Msg — событие заказа. Факт в прошедшем времени: отправитель не знает, кто
 // на него подпишется, и ничего не ждёт в ответ.
 type Msg struct {
@@ -360,6 +369,37 @@ func (k *Kafka) ProduceTo(ctx context.Context, partition int32, e Msg) error {
 	}).FirstErr()
 }
 
+// DropTopic сносит названную тему и ждёт, пока она действительно исчезнет.
+// Удаление в KRaft асинхронное: тот, кто создаёт тему сразу после удаления,
+// иногда получает прежнюю.
+func DropTopic(ctx context.Context, brokers []string, topic string) error {
+	cl, err := DialKafka(brokers)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	return dropTopic(ctx, kadm.NewClient(cl.cl), topic, time.Now().Add(30*time.Second))
+}
+
+func dropTopic(ctx context.Context, adm *kadm.Client, topic string, deadline time.Time) error {
+	if _, err := adm.DeleteTopics(ctx, topic); err != nil {
+		return err
+	}
+	for {
+		topics, err := adm.ListTopics(ctx, topic)
+		if err != nil {
+			return err
+		}
+		if !topics.Has(topic) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("прежняя тема %s не удалилась за 30 с", topic)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // RecreateTopic сносит лог и заводит его заново. Сцена обязана начинаться с
 // пустого лога: студент сверяет число записей с текстом шага.
 func RecreateTopic(ctx context.Context, brokers []string, partitions int32) error {
@@ -370,24 +410,11 @@ func RecreateTopic(ctx context.Context, brokers []string, partitions int32) erro
 	defer cl.Close()
 	adm := kadm.NewClient(cl.cl)
 
-	if _, err := adm.DeleteTopics(ctx, Topic); err != nil {
-		return err
-	}
-	// Удаление в KRaft асинхронное: создать тему сразу после удаления —
-	// значит иногда получить прежнее число партиций и молча сломать сцену 16.
 	deadline := time.Now().Add(30 * time.Second)
-	for {
-		topics, err := adm.ListTopics(ctx, Topic)
-		if err != nil {
-			return err
-		}
-		if !topics.Has(Topic) {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("прежняя тема %s не удалилась за 30 с", Topic)
-		}
-		time.Sleep(200 * time.Millisecond)
+	// Сцена 16 ломается молча, если тема пережила удаление со старым числом
+	// партиций, — поэтому ждём исчезновения, а не «удаляем и создаём».
+	if err := dropTopic(ctx, adm, Topic, deadline); err != nil {
+		return err
 	}
 
 	for {
@@ -422,6 +449,48 @@ func EndOffsets(ctx context.Context, brokers []string) (int64, error) {
 	var total int64
 	offsets.Each(func(o kadm.ListedOffset) { total += o.Offset })
 	return total, nil
+}
+
+// Raw — запись лога как она есть, ключ и значение. Нужна там, где тему пишет
+// не стенд, а внешний компонент: у журнала изменений базы своя схема, и
+// разобрать его значение в Msg нельзя — в этом весь предмет сцены 19.
+type Raw struct {
+	Key   []byte
+	Value []byte
+}
+
+// ReadRaw читает названную тему с начала целиком. Группы у читателя нет: он
+// ничего не отмечает и никому не мешает — сцена только смотрит, что лежит.
+func ReadRaw(ctx context.Context, brokers []string, topic string, idle time.Duration) ([]Raw, error) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cl.Close()
+
+	var out []Raw
+	for {
+		pollCtx, cancel := context.WithTimeout(ctx, idle)
+		fetches := cl.PollFetches(pollCtx)
+		cancel()
+		if fetches.IsClientClosed() {
+			return out, nil
+		}
+		// Темы ещё может не быть вовсе: коннектор заводит её сам, когда ему
+		// есть что положить. Это не ошибка, а «пока пусто».
+		empty := true
+		fetches.EachRecord(func(r *kgo.Record) {
+			empty = false
+			out = append(out, Raw{Key: r.Key, Value: r.Value})
+		})
+		if empty {
+			return out, nil
+		}
+	}
 }
 
 // ReadAll читает лог новой группой с начала и возвращает всё, что там лежит.

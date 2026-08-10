@@ -710,6 +710,7 @@ func scene17(ctx context.Context, r *Run) error {
 	r.Set("first_order", strconv.FormatInt(cfg.FirstOrderID, 10))
 	r.Set("last_order", strconv.FormatInt(last, 10))
 	r.Set("good", strconv.Itoa(total-1))
+	r.Set("amount", strconv.FormatInt(cfg.Amount, 10))
 
 	// Потребитель работает всё это время: он и покажет, что до него дошло.
 	if err := r.configureCourier(map[string]any{"source": "amqp", "ack": "after"}); err != nil {
@@ -821,6 +822,7 @@ func scene18(ctx context.Context, r *Run) error {
 	r.Set("first_order", strconv.FormatInt(cfg.FirstOrderID, 10))
 	r.Set("last_order", strconv.FormatInt(last, 10))
 	r.Set("good", strconv.Itoa(total-1))
+	r.Set("amount", strconv.FormatInt(cfg.Amount, 10))
 
 	r.T0 = time.Now()
 

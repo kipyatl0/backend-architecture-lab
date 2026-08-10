@@ -110,6 +110,11 @@ type ScriptConfig struct {
 	IdempotentCons bool    `json:"idempotent_consumer"`
 	FailStep       string  `json:"fail_step"`
 	WorkMS         int     `json:"work_ms"`
+
+	// журнал репликации базы
+	PreOrders int     `json:"pre_orders"` // строк, появившихся до того, как за журналом начали следить
+	BulkAtS   float64 `json:"bulk_at_s"`
+	DeleteAtS float64 `json:"delete_at_s"`
 }
 
 // Значения по умолчанию у ручек обмена — не «на всякий случай», а часть

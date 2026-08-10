@@ -1,0 +1,49 @@
+Сцена 19 · m07 l03 · профиль cdc · детерминирована
+CDC: журнал базы как источник событий
+Сервис заказов не публикует событий вовсе: ни прямой отправки, ни исходящего ящика
+В его базе уже лежат 2 заказа (7714 и 7715), созданных до того, как за журналом кто-то следил
+Времена подключения к журналу зависят от машины сильнее обычного — сверяй содержание записей, а не секунды
+
+t=0.000  connector  → postgres   подключение к журналу репликации: слот lab_orders, публикация lab_orders_pub
+t=2.000  connector  ← postgres   начальный снимок: 2 записи, op=r                                        история досталась тому, кто её не публиковал
+t=6.000  client     → orders     POST /orders {amount: 1890} — заказ 7716
+t=6.300  connector  ← postgres   op=c по заказу 7716                                                     приложение не отправило ни одного события
+t=9.000  orders     → postgres   UPDATE orders SET status='cancelled' WHERE restaurant='Пекарня «Батон»'  ресторан закрылся: одна команда оператора
+t=9.300  connector  ← postgres   3 записи op=u — по одной на строку                                      причины отмены нет ни в одной из них
+t=12.000 orders     → postgres   DELETE FROM orders WHERE id=7714                                        клиент попросил удалить свои данные
+t=12.300 connector  ← postgres   op=d: after пустой                                                      в before только первичный ключ
+ИТОГ: заказов в базе 2, в очереди courier 0 сообщений, в логе order-events 0 записей, в теме cdc.public.orders 7 записей — r=2, c=1, u=3, d=1
+
+Тема cdc.public.orders целиком — по строке на запись (op: r — снимок, c — вставка, u — обновление, d — удаление):
+
+  #1  op=r  id=7714  before: —                               after: status=paid
+  #2  op=r  id=7715  before: —                               after: status=paid
+  #3  op=c  id=7716  before: —                               after: status=paid
+  #4  op=u  id=7714  before: —                               after: status=cancelled
+  #5  op=u  id=7715  before: —                               after: status=cancelled
+  #6  op=u  id=7716  before: —                               after: status=cancelled
+  #7  op=d  id=7714  before: только ключ id=7714             after: —
+
+Запись #4 целиком — та же строка после массовой отмены:
+
+  {"op": "u",
+   "before": null,
+   "after": {"id": 7714, "client": "Ирина", "restaurant": "Пекарня «Батон»",
+             "amount": 1890, "status": "cancelled", "charge": null, "created_at": …},
+   "source": {"db": "orders", "schema": "public", "table": "orders", "lsn": …, "txId": …},
+   "ts_ms": …}
+
+Запись #7 — удаление:
+
+  {"op": "d",
+   "before": {"id": 7714, "client": "", "restaurant": "",
+              "amount": 0, "status": "", "charge": null, "created_at": "1970-01-01T00:00:00.000000Z"},
+   "after": null,
+   "source": {"db": "orders", "schema": "public", "table": "orders", "lsn": …, "txId": …},
+   "ts_ms": …}
+
+Служебные поля (lsn, txId, метки времени) сокращены до «…»: они меняются каждый прогон. Всё остальное — как лежит в теме.
+Имя темы дал не отправитель, а таблица: cdc.public.orders — это «схема public, таблица orders». Переименуешь столбец — переименуется поле у всех получателей.
+Тип события в потоке — op (r, c, u, d), а не order.paid. Отмену по закрытому ресторану и отмену по просьбе клиента журнал печатает одинаково: намерение в него не попадает.
+Массовая отмена пришла тремя отдельными записями. Получатель не может отличить их от трёх независимых отмен — и обязан пережить все три.
+Ни одна строка кода отправки в этом прогоне не исполнилась: очередь и лог событий пусты, а поток при этом есть.

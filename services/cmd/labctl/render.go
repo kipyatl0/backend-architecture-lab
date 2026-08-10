@@ -35,10 +35,13 @@ func renderTimeline(rows []row) []string {
 		if n := width(tokens[i]) + 1; n > timeW {
 			timeW = n
 		}
-		if n := width(r.From); n > fromW {
+		// Ширина считается с запасом в пробел: pad всегда отделяет колонку от
+		// следующей, и без этого запаса самая длинная строка съезжает вправо
+		// на один знак относительно всех остальных.
+		if n := width(r.From) + 1; n > fromW {
 			fromW = n
 		}
-		if n := width(r.To); n > toW {
+		if n := width(r.To) + 1; n > toW {
 			toW = n
 		}
 		if r.Note != "" {

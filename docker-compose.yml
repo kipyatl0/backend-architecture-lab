@@ -346,6 +346,13 @@ services:
       LAB_ORDERS_URL: http://orders:8050
       LAB_RELAY_URL: http://outbox-relay:8040
       LAB_DEBEZIUM_URL: http://debezium:8083
+      # К какой базе подключать коннектор захвата изменений: он ходит в неё
+      # сам, мимо сервиса, — этим приёмом приложение и не задействовано.
+      LAB_CDC_DB_HOST: postgres
+      LAB_CDC_DB_PORT: "5432"
+      LAB_CDC_DB_USER: delivery
+      LAB_CDC_DB_PASSWORD: delivery
+      LAB_CDC_DB_NAME: orders
       LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
       LAB_KAFKA_BROKERS: kafka:9092
       LAB_SCENES_DIR: /lab/scenes

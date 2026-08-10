@@ -102,6 +102,9 @@ func main() {
 	mux.HandleFunc("POST /_lab/config", a.handleConfig)
 	mux.HandleFunc("POST /_lab/prepare", a.handlePrepare)
 	mux.HandleFunc("POST /_lab/emit", a.handleEmit)
+	mux.HandleFunc("POST /_lab/bulk-cancel", a.handleBulkCancel)
+	mux.HandleFunc("POST /_lab/erase", a.handleErase)
+	mux.HandleFunc("POST /_lab/cdc-reset", a.handleCDCReset)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
 
 	addr := lab.Env("LAB_ADDR", ":8050")
@@ -587,6 +590,115 @@ func (a *app) handleEmit(w http.ResponseWriter, r *http.Request) {
 	a.rec.Record(fmt.Sprintf("orders.emit#%d", req.Seq),
 		map[string]string{"order": strconv.FormatInt(req.Order, 10), "type": req.Type})
 	lab.WriteJSON(w, http.StatusOK, msg)
+}
+
+// ── обслуживание данных руками: то, что делает не сервис, а человек ─────────
+//
+// Обе операции ниже — не «функции сервиса заказов», а то, что в жизни делает
+// оператор или дежурный: отменить одной командой всё по закрывшемуся ресторану,
+// удалить данные клиента по его просьбе. Приложение при этом не публикует
+// ничего и не знает, что за его таблицами кто-то следит, — и ровно поэтому
+// сцена 19 показывает на них цену захвата изменений.
+
+func (a *app) handleBulkCancel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Restaurant string `json:"restaurant"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tag, err := a.pool.Exec(r.Context(),
+		`UPDATE orders SET status='cancelled' WHERE restaurant=$1 AND status<>'cancelled'`, req.Restaurant)
+	if err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	n := tag.RowsAffected()
+	a.rec.Record("orders.bulk", map[string]string{"rows": strconv.FormatInt(n, 10)})
+	a.log.Info("массовая отмена одной командой", "restaurant", req.Restaurant, "rows", n)
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": n})
+}
+
+func (a *app) handleErase(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order int64 `json:"order"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tag, err := a.pool.Exec(r.Context(), `DELETE FROM orders WHERE id=$1`, req.Order)
+	if err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	n := tag.RowsAffected()
+	a.rec.Record("orders.erase", map[string]string{"order": strconv.FormatInt(req.Order, 10)})
+	a.log.Info("строка удалена по просьбе клиента", "order", req.Order, "rows", n)
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": n})
+}
+
+// handleCDCReset возвращает базу в состояние «за журналом никто не следит»:
+// сносит слоты репликации прошлых прогонов и публикацию. Без этого второй
+// запуск сцены 19 не сделал бы начального снимка — коннектор продолжил бы с
+// того места, где остановился прошлый, — и упёрся бы в предел слотов.
+func (a *app) handleCDCReset(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	dropped := []string{}
+
+	// Слот, который ещё держит умирающий коннектор, отпускается не мгновенно.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		rows, err := a.pool.Query(ctx,
+			`SELECT slot_name, active FROM pg_replication_slots WHERE slot_name LIKE 'lab_orders%'`)
+		if err != nil {
+			lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		type slot struct {
+			name   string
+			active bool
+		}
+		var slots []slot
+		for rows.Next() {
+			var s slot
+			if err := rows.Scan(&s.name, &s.active); err == nil {
+				slots = append(slots, s)
+			}
+		}
+		rows.Close()
+
+		busy := false
+		for _, s := range slots {
+			if s.active {
+				busy = true
+				continue
+			}
+			if _, err := a.pool.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, s.name); err != nil {
+				busy = true
+				continue
+			}
+			dropped = append(dropped, s.name)
+		}
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			lab.WriteJSON(w, http.StatusConflict, map[string]any{
+				"error": "слот репликации всё ещё занят: коннектор прошлого прогона жив",
+			})
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if _, err := a.pool.Exec(ctx, `DROP PUBLICATION IF EXISTS `+lab.CDCPublication); err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.log.Info("журнал репликации возвращён в исходное состояние", "slots", dropped)
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"dropped": dropped})
 }
 
 func (a *app) handleState(w http.ResponseWriter, r *http.Request) {

@@ -1,0 +1,114 @@
+{
+  "id": "19",
+  "config": {
+    "amount": 1890,
+    "client": "Ирина",
+    "restaurant": "Пекарня «Батон»",
+    "first_order_id": 7714,
+    "pre_orders": 2,
+    "second_phase_at_s": 6.0,
+    "bulk_at_s": 9.0,
+    "delete_at_s": 12.0
+  },
+  "fields": {},
+  "header": [
+    "Сервис заказов не публикует событий вовсе: ни прямой отправки, ни исходящего ящика",
+    "В его базе уже лежат {{pre}} заказа ({{first_order}} и {{last_pre_order}}), созданных до того, как за журналом кто-то следил",
+    "Времена подключения к журналу зависят от машины сильнее обычного — сверяй содержание записей, а не секунды"
+  ],
+  "timeline": [
+    {
+      "key": "cdc.connect",
+      "at": 0.0,
+      "tol": 5.0,
+      "from": "connector",
+      "arrow": "→",
+      "to": "postgres",
+      "detail": "подключение к журналу репликации: слот {{slot}}, публикация {{publication}}"
+    },
+    {
+      "key": "cdc.snapshot",
+      "at": 2.0,
+      "tol": 25.0,
+      "from": "connector",
+      "arrow": "←",
+      "to": "postgres",
+      "detail": "начальный снимок: {{n_r}} записи, op=r",
+      "note": "история досталась тому, кто её не публиковал"
+    },
+    {
+      "key": "client.create",
+      "at": 6.0,
+      "tol": 25.0,
+      "from": "client",
+      "arrow": "→",
+      "to": "orders",
+      "detail": "POST /orders {amount: {{amount}}} — заказ {{new_order}}"
+    },
+    {
+      "key": "cdc.insert",
+      "at": 6.3,
+      "tol": 25.0,
+      "from": "connector",
+      "arrow": "←",
+      "to": "postgres",
+      "detail": "op=c по заказу {{new_order}}",
+      "note": "приложение не отправило ни одного события"
+    },
+    {
+      "key": "orders.bulk",
+      "at": 9.0,
+      "tol": 25.0,
+      "from": "orders",
+      "arrow": "→",
+      "to": "postgres",
+      "detail": "UPDATE orders SET status='cancelled' WHERE restaurant='{{restaurant}}'",
+      "note": "ресторан закрылся: одна команда оператора"
+    },
+    {
+      "key": "cdc.update",
+      "at": 9.3,
+      "tol": 25.0,
+      "from": "connector",
+      "arrow": "←",
+      "to": "postgres",
+      "detail": "{{bulk_rows}} записи op=u — по одной на строку",
+      "note": "причины отмены нет ни в одной из них"
+    },
+    {
+      "key": "orders.erase",
+      "at": 12.0,
+      "tol": 25.0,
+      "from": "orders",
+      "arrow": "→",
+      "to": "postgres",
+      "detail": "DELETE FROM orders WHERE id={{first_order}}",
+      "note": "клиент попросил удалить свои данные"
+    },
+    {
+      "key": "cdc.delete",
+      "at": 12.3,
+      "tol": 25.0,
+      "from": "connector",
+      "arrow": "←",
+      "to": "postgres",
+      "detail": "op=d: after пустой",
+      "note": "в before только первичный ключ"
+    }
+  ],
+  "ignore": ["orders.committed"],
+  "summary": "ИТОГ: заказов в базе {{in_db}}, в очереди courier {{queue_left}} сообщений, в логе order-events {{log_left}} записей, в теме {{topic}} {{cdc_total}} записей — r={{n_r}}, c={{n_c}}, u={{n_u}}, d={{n_d}}",
+  "legend": [
+    "{{records}}",
+    "",
+    "{{sample}}",
+    "",
+    "{{erased}}",
+    "",
+    "Служебные поля (lsn, txId, метки времени) сокращены до «…»: они меняются каждый прогон. Всё остальное — как лежит в теме.",
+    "Имя темы дал не отправитель, а таблица: {{topic}} — это «схема public, таблица orders». Переименуешь столбец — переименуется поле у всех получателей.",
+    "Тип события в потоке — op (r, c, u, d), а не order.paid. Отмену по закрытому ресторану и отмену по просьбе клиента журнал печатает одинаково: намерение в него не попадает.",
+    "Массовая отмена пришла тремя отдельными записями. Получатель не может отличить их от трёх независимых отмен — и обязан пережить все три.",
+    "Ни одна строка кода отправки в этом прогоне не исполнилась: очередь и лог событий пусты, а поток при этом есть."
+  ]
+}
