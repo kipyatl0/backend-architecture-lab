@@ -31,6 +31,12 @@ type Run struct {
 	DebeziumURL  string
 	AMQPURL      string
 	Brokers      []string
+	// Профиль cluster: обе копии базы напрямую и управление узлами. Сцены m08
+	// спрашивают не приложение, а сами узлы — «что у тебя лежит» и «жив ли ты».
+	PrimaryDSN string
+	ReplicaDSN string
+	RedisAddr  string
+	Docker     *lab.Docker
 
 	// С кого собираются наблюдения. До m06 сцену наблюдал один монолит; с
 	// появлением второго и третьего сервиса источников становится несколько,
@@ -59,6 +65,10 @@ func newRun(scene Scene, script Script) *Run {
 		DebeziumURL:  lab.Env("LAB_DEBEZIUM_URL", "http://debezium:8083"),
 		AMQPURL:      lab.Env("LAB_AMQP_URL", "amqp://lab:lab@rabbitmq:5672/"),
 		Brokers:      strings.Split(lab.Env("LAB_KAFKA_BROKERS", "kafka:9092"), ","),
+		PrimaryDSN:   lab.Env("LAB_PRIMARY_DSN", "postgres://delivery:delivery@postgres:5432/orders?sslmode=disable"),
+		ReplicaDSN:   lab.Env("LAB_REPLICA_DSN", "postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable"),
+		RedisAddr:    lab.Env("LAB_REDIS_ADDR", "redis:6379"),
+		Docker:       lab.NewDocker(lab.Env("LAB_COMPOSE_PROJECT", "backend-architecture-lab")),
 		// Управляющий клиент — не участник сцены: его таймаут щедрый,
 		// иначе он сам стал бы источником отказа.
 		ctl:      &http.Client{Timeout: 60 * time.Second},
@@ -270,10 +280,13 @@ func (r *Run) reportTimeline(explain bool) (string, []string) {
 		inScript[l.Key] = true
 		ev, ok := events[l.Key]
 		rows = append(rows, row{
-			At:     l.At,
-			From:   l.From,
+			At: l.At,
+			// Имена сторон тоже подставляются: в сценах кластера действующее
+			// лицо — конкретный узел, и какой именно, известно только в
+			// прогоне (лидера выбирает кластер, а не сценарий).
+			From:   substitute(l.From, ev.Fields, r.fields, r.Script.Fields),
 			Arrow:  l.Arrow,
-			To:     l.To,
+			To:     substitute(l.To, ev.Fields, r.fields, r.Script.Fields),
 			Detail: substitute(l.Detail, ev.Fields, r.fields, r.Script.Fields),
 			Note:   substitute(l.Note, ev.Fields, r.fields, r.Script.Fields),
 		})

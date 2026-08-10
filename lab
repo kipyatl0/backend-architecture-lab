@@ -18,7 +18,7 @@ STATE_DIR="$LAB_DIR/.lab"
 PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
-KNOWN_PROFILES="mono split net broker cdc"
+KNOWN_PROFILES="mono split net broker cdc cluster cache"
 
 # Где живёт модуль уведомлений в каждом профиле. Служба одна и та же — меняется
 # только это, и ровно из этого вырастают сцены m03 l05 и весь m05.
@@ -30,6 +30,16 @@ notifier_url() {
     broker) printf 'http://notifier:8070' ;;     # рядом с брокером: вызовом ИЛИ подпиской
     cdc)    printf 'http://notifier:8070' ;;
     *)      printf '' ;;
+  esac
+}
+
+# Куда идти за брокером. До m08 узел один; в профиле кластера их три, и адрес
+# у сервисов и у исполнителя сцен обязан быть один и тот же — иначе сцена
+# писала бы в один кластер, а проверяла другой.
+kafka_brokers() {
+  case "$1" in
+    cluster) printf 'kafka-1:9092,kafka-2:9092,kafka-3:9092' ;;
+    *)       printf 'kafka:9092' ;;
   esac
 }
 
@@ -84,15 +94,24 @@ remember_profile() {
 labctl() {
   local profile; profile="$(current_profile)"
   LAB_PROFILE="$profile" LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
+  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" \
     compose --profile cli run --rm --no-deps -T labctl "$@"
 }
 
 raise() {
   local profile="$1"
   known_profile "$profile"
+  # Профили не работают вместе: кластер m08 рядом с брокером m06 не влезает в
+  # 4 ГБ, а смысла в этом нет — в кадре должно быть только то, что уже введено.
+  local prev; prev="$(current_profile)"
+  if [ -n "$prev" ] && [ "$prev" != "$profile" ]; then
+    say "Опускаю профиль $prev…"
+    compose_all stop >&2
+  fi
   say "Поднимаю профиль $profile…"
   # Смена профиля меняет окружение монолита — Compose пересоздаёт контейнер сам.
   LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
+  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" \
     compose --profile "$profile" up -d --wait >&2
   remember_profile "$profile"
 }
@@ -172,6 +191,8 @@ lab — стенд курса «Архитектура бэкенда: расп�
   net     то же самое плюс посредник, которому сцена портит сеть
   broker  очередь и лог рядом: обмен событиями, исходящий ящик, сага
   cdc     то же плюс чтение журнала репликации базы
+  cluster брокер из трёх узлов и вторая копия базы: кворум, ISR, отставание
+  cache   быстрая память рядом с базой: проекция, кэш, аренда блокировки
 TXT
 }
 

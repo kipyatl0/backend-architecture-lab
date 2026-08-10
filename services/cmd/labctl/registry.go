@@ -111,6 +111,22 @@ type ScriptConfig struct {
 	FailStep       string  `json:"fail_step"`
 	WorkMS         int     `json:"work_ms"`
 
+	// копии данных: кластер брокера и вторая копия базы (m08)
+	ReadAtS []float64 `json:"read_at_s"` // когда клиент перечитывает заказ
+	RF      int       `json:"rf"`        // сколько копий у темы
+	MinISR  int       `json:"min_isr"`   // сколько из них обязаны быть в синхроне
+	SkewMS  int       `json:"skew_ms"`   // на сколько разъехались часы второго узла
+	Events  int       `json:"events"`
+
+	// путь чтения: проекция, кэш, аренда блокировки (m09)
+	Clients    int `json:"clients"`      // сколько читателей приходит разом
+	ProjectMS  int `json:"project_ms"`   // сколько занимает применение события к проекции
+	CardMS     int `json:"card_ms"`      // сколько стоит поход в базу за карточкой
+	CacheTTLMS int `json:"cache_ttl_ms"` // сколько живёт значение в кэше
+	LeaseMS    int `json:"lease_ms"`     // на сколько берётся аренда блокировки
+	StallMS    int `json:"stall_ms"`     // сколько держатель аренды не подаёт признаков жизни
+	Burst      int `json:"burst"`        // сколько записей подаётся потоком
+
 	// журнал репликации базы
 	PreOrders int     `json:"pre_orders"` // строк, появившихся до того, как за журналом начали следить
 	BulkAtS   float64 `json:"bulk_at_s"`

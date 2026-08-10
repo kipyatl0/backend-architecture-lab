@@ -41,12 +41,22 @@ type config struct {
 	FailStep string `json:"fail_step"`
 	// Выполнять ли компенсации после поломки.
 	Compensate bool `json:"compensate"`
+
+	// Откуда сервис читает: primary — из первичного узла, replica — из второй
+	// копии. Переключатель сцены m08 l01: код чтения при этом не меняется.
+	ReadFrom string `json:"read_from"`
+	// Кэш карточки ресторана (m09 l04): сколько живёт значение, сколько стоит
+	// поход в базу и ходит ли за всех один.
+	CacheTTLMS   int  `json:"cache_ttl_ms"`
+	CardMS       int  `json:"card_ms"`
+	SingleFlight bool `json:"single_flight"`
 }
 
 func defaults() config {
 	return config{
 		WriteMode: "none", Target: "both", CrashAfterCommit: false,
 		Saga: false, FailStep: "", Compensate: true,
+		ReadFrom: "primary", CacheTTLMS: 2000, CardMS: 200, SingleFlight: false,
 	}
 }
 
@@ -70,6 +80,10 @@ type app struct {
 	// невозвратным. Это и есть то, что студент читает в выводе сцены.
 	sagaLog []string
 	seq     int
+
+	// Путь чтения: вторая копия базы и кэш перед ней. Заведён отдельно —
+	// путь записи от его появления не изменился (см. read.go).
+	read *readSide
 }
 
 func main() {
@@ -93,6 +107,7 @@ func main() {
 		amqpURL:  lab.Env("LAB_AMQP_URL", "amqp://lab:lab@rabbitmq:5672/"),
 		brokers:  strings.Split(lab.Env("LAB_KAFKA_BROKERS", "kafka:9092"), ","),
 		http:     &http.Client{Timeout: 30 * time.Second},
+		read:     newReadSide(),
 	}
 
 	mux := http.NewServeMux()
@@ -106,6 +121,10 @@ func main() {
 	mux.HandleFunc("POST /_lab/erase", a.handleErase)
 	mux.HandleFunc("POST /_lab/cdc-reset", a.handleCDCReset)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
+	mux.HandleFunc("GET /orders/{id}", a.handleReadOrder)
+	mux.HandleFunc("GET /restaurants/{name}", a.handleCard)
+	mux.HandleFunc("GET /_lab/read-stats", a.handleReadStats)
+	mux.HandleFunc("POST /_lab/read-reset", a.handleReadReset)
 
 	addr := lab.Env("LAB_ADDR", ":8050")
 	if err := lab.Serve(addr, mux, log, nil); err != nil {
@@ -496,6 +515,10 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		Saga             *bool   `json:"saga"`
 		FailStep         *string `json:"fail_step"`
 		Compensate       *bool   `json:"compensate"`
+		ReadFrom         *string `json:"read_from"`
+		CacheTTLMS       *int    `json:"cache_ttl_ms"`
+		CardMS           *int    `json:"card_ms"`
+		SingleFlight     *bool   `json:"single_flight"`
 		Reset            bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -525,6 +548,18 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Compensate != nil {
 		a.cfg.Compensate = *req.Compensate
+	}
+	if req.ReadFrom != nil {
+		a.cfg.ReadFrom = *req.ReadFrom
+	}
+	if req.CacheTTLMS != nil {
+		a.cfg.CacheTTLMS = *req.CacheTTLMS
+	}
+	if req.CardMS != nil {
+		a.cfg.CardMS = *req.CardMS
+	}
+	if req.SingleFlight != nil {
+		a.cfg.SingleFlight = *req.SingleFlight
 	}
 	cfg := a.cfg
 	a.mu.Unlock()

@@ -457,6 +457,13 @@ func EndOffsets(ctx context.Context, brokers []string) (int64, error) {
 type Raw struct {
 	Key   []byte
 	Value []byte
+	// Место записи в логе и время, которое поставил отправитель. До m08 они
+	// сцене были не нужны; в сцене про разъехавшиеся часы именно расхождение
+	// между «когда записал отправитель» и «в каком порядке лежит в логе» и
+	// есть весь предмет.
+	Partition int32
+	Offset    int64
+	At        time.Time
 }
 
 // ReadRaw читает названную тему с начала целиком. Группы у читателя нет: он
@@ -485,7 +492,10 @@ func ReadRaw(ctx context.Context, brokers []string, topic string, idle time.Dura
 		empty := true
 		fetches.EachRecord(func(r *kgo.Record) {
 			empty = false
-			out = append(out, Raw{Key: r.Key, Value: r.Value})
+			out = append(out, Raw{
+				Key: r.Key, Value: r.Value,
+				Partition: r.Partition, Offset: r.Offset, At: r.Timestamp,
+			})
 		})
 		if empty {
 			return out, nil

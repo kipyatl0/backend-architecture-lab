@@ -8,6 +8,8 @@ name: backend-architecture-lab
 #   net     m05           + toxiproxy: сеть можно рвать и замедлять
 #   broker  m06–m07       + rabbitmq, kafka, courier, orders, outbox-relay
 #   cdc     m07 l03       + debezium: события из журнала репликации
+#   cluster m08           kafka ×3 и реплика базы: кворум, ISR, отставание
+#   cache   m09           + redis: проекция, кэш, распределённая блокировка
 #
 # Служба одна и та же во всех профилях — меняется только то, где живёт модуль
 # уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же): пусто —
@@ -23,7 +25,7 @@ services:
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono, split, net, broker, cdc]
+    profiles: [mono, split, net, broker, cdc, cluster, cache]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -34,10 +36,15 @@ services:
     # wal_level=logical включён всегда, а не только в профиле cdc: иначе
     # сцена 19 требовала бы перезапуска базы посреди курса, а разницы в
     # наблюдаемом поведении остальных сцен от него нет.
+    # Правила доступа лежат отдельным файлом (см. config/pg_hba.conf): реплике
+    # нужна строка про replication, а дописать её скриптом инициализации значило
+    # бы починить профиль cluster только тем, кто поднимает стенд с нуля.
     command: >
       postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
                -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+               -c hba_file=/etc/postgresql/pg_hba.conf
     volumes:
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
       # С 18 официальный образ держит данные в /var/lib/postgresql/<мажор>/docker,
       # а томом объявляет /var/lib/postgresql — монтируем именно его. При смене
       # мажорной версии этот путь надо проверять заново: со старым
@@ -168,7 +175,7 @@ services:
 
   kafka:
     image: apache/kafka:4.3.1
-    profiles: [broker, cdc]
+    profiles: [broker, cdc, cache]
     environment:
       # KRaft: контроллер и брокер в одном узле, ZooKeeper не нужен.
       KAFKA_NODE_ID: 1
@@ -240,26 +247,34 @@ services:
       context: ./services
       args:
         BIN: orders
-    profiles: [broker, cdc]
+    profiles: [broker, cdc, cluster, cache]
     environment:
       LAB_SERVICE: orders
       LAB_ADDR: ":8050"
-      LAB_DATABASE_URL: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable
+      # Пул пошире обычного: сцена про давку на промахе кэша подаёт сотню
+      # одновременных читателей, и на пуле по умолчанию она показывала бы
+      # очередь к соединениям вместо очереди к базе.
+      LAB_DATABASE_URL: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable&pool_max_conns=25
       LAB_BOOTSTRAP_URL: postgres://delivery:delivery@postgres:5432/delivery?sslmode=disable
+      # Тот же сервис, но подключённый ко второй копии базы. Читать из неё или
+      # из первичного узла — переключатель сцены (m08 l01), а не свойство
+      # сервиса: ровно в этом переключателе и живёт устаревшее чтение.
+      LAB_REPLICA_URL: postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable
+      LAB_REDIS_ADDR: redis:6379
       LAB_ACQUIRER_URL: http://acquirer:8090
       LAB_COURIER_URL: http://courier:8060
       LAB_NOTIFIER_URL: http://notifier:8070
       LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
-      LAB_KAFKA_BROKERS: kafka:9092
+      # Куда публиковать: один узел в m06–m07, три в m08. Значение подставляет
+      # `lab` по имени профиля.
+      LAB_KAFKA_BROKERS: ${LAB_KAFKA_BROKERS:-kafka:9092}
     # Сцены m07 роняют этот сервис намеренно: предмет урока — что осталось в
     # базе и что не осталось в брокере, а не то, что стенд лежит.
     restart: unless-stopped
+    # Ждём только базу: до брокера сервис доходит лениво, в момент публикации,
+    # и в профилях m08–m09 брокера рядом может не быть вовсе.
     depends_on:
       postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8050/ready"]
@@ -326,6 +341,126 @@ services:
       start_period: 20s
     mem_limit: 1024m
 
+  # ── профиль cluster: три узла вместо одного ─────────────────────────────
+  # Тот же брокер, что в m06, только собранный в кластер: смена продукта
+  # посреди курса объясняла бы студенту стенд вместо предмета. Узлы совмещают
+  # роли брокера и голосующего — три отдельных контроллера рядом с тремя
+  # брокерами в 4 ГБ ноутбука не помещаются, а предмет модуля — копии данных,
+  # а не топология служебного кворума.
+  #
+  # Куча по 320 МБ на узел: логи сцен — десятки сообщений, и всё, что сверх
+  # этого, уходит в потолок памяти, а не в предмет.
+
+  kafka-1: &cluster-node
+    image: apache/kafka:4.3.1
+    profiles: [cluster]
+    environment: &cluster-env
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      # Служебные темы живут в трёх копиях: иначе смерть одного узла уносила бы
+      # смещения групп, и сцена показывала бы поломку не про то.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Сколько узел может молчать, прежде чем его выведут из синхронного
+      # набора. По умолчанию 30 с — сцена ждала бы полминуты на ровном месте.
+      KAFKA_REPLICA_LAG_TIME_MAX_MS: 5000
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xmx320m -Xms320m"
+    volumes:
+      - kafka1data:/var/lib/kafka
+    healthcheck: &cluster-health
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+    mem_limit: 700m
+
+  kafka-2:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes:
+      - kafka2data:/var/lib/kafka
+
+  kafka-3:
+    <<: *cluster-node
+    environment:
+      <<: *cluster-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes:
+      - kafka3data:/var/lib/kafka
+
+  # Вторая копия базы. Данные держит в памяти, а не в томе, — и это не
+  # экономия: сцена m08 l03 промотирует реплику в первичный узел, после чего
+  # вернуть её в строй можно только пересборкой с нуля. Перезапуск контейнера
+  # чистит tmpfs, и базовая копия снимается заново — на этом и построен сброс.
+  postgres-replica:
+    image: postgres:18.4-alpine
+    profiles: [cluster]
+    user: "70:70"
+    environment:
+      PGPASSWORD: delivery
+    tmpfs:
+      - /var/lib/postgresql/18/docker:mode=700,uid=70,gid=70
+    entrypoint: ["/bin/sh", "-c"]
+    # Отставание в 2 с задано стендом намеренно: на одной машине настоящий лаг
+    # репликации — единицы миллисекунд, и устаревшее чтение из него не увидеть
+    # ни глазом, ни сценой.
+    command:
+      - |
+        until pg_basebackup -d "postgresql://delivery@postgres:5432/postgres" \
+              -D /var/lib/postgresql/18/docker -Fp -Xs -R -w; do
+          echo "жду первичный узел…" >&2
+          sleep 1
+        done
+        exec postgres -D /var/lib/postgresql/18/docker \
+             -c hot_standby=on -c recovery_min_apply_delay=2s \
+             -c fsync=off -c full_page_writes=off
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U delivery -d orders -h 127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+    mem_limit: 512m
+
+  # ── профиль cache: быстрая память рядом с базой ─────────────────────────
+  # Хранилище на стороне читателя: проекция, кэш карточки ресторана и аренда
+  # распределённой блокировки. Сохранять на диск ему нечего — всё, что в нём
+  # лежит, по определению восстановимо из базы.
+
+  redis:
+    image: redis:8.10.0-alpine
+    profiles: [cache]
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    mem_limit: 128m
+
   # ── исполнитель сцен ────────────────────────────────────────────────────
   # Не сервис: поднимается на время одной сцены через `docker compose run`.
   # Живёт в своём профиле, чтобы `lab up <профиль>` его не запускал.
@@ -354,14 +489,29 @@ services:
       LAB_CDC_DB_PASSWORD: delivery
       LAB_CDC_DB_NAME: orders
       LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
-      LAB_KAFKA_BROKERS: kafka:9092
+      LAB_KAFKA_BROKERS: ${LAB_KAFKA_BROKERS:-kafka:9092}
+      # Прямой доступ к обеим копиям базы: сцены m08 сравнивают, что видно на
+      # первичном узле и что — на реплике, а это вопрос не к приложению.
+      LAB_PRIMARY_DSN: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable
+      LAB_REPLICA_DSN: postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable
+      LAB_REDIS_ADDR: redis:6379
+      # Имя проекта Compose: по нему сцена находит контейнеры узлов, чтобы
+      # ронять и поднимать их. Совпадает с `name:` в начале файла.
+      LAB_COMPOSE_PROJECT: backend-architecture-lab
       LAB_SCENES_DIR: /lab/scenes
       LAB_PROFILE: ${LAB_PROFILE:-}
     volumes:
       # Реестр сцен — данные, а не код: правка сцены не требует пересборки.
       - ./scenes:/lab/scenes:ro
+      # Предмет m08 — смерть узла, а не смерть процесса приложения: у брокера
+      # нет ручки «умри», и уронить его можно только снаружи. Сокет доступен
+      # только исполнителю сцен и только на время одной команды.
+      - /var/run/docker.sock:/var/run/docker.sock
     mem_limit: 128m
 
 volumes:
   pgdata:
   kafkadata:
+  kafka1data:
+  kafka2data:
+  kafka3data:
