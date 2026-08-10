@@ -17,9 +17,14 @@ import (
 // на первом же прогоне.
 
 func renderTable(t Table, fields ...map[string]string) []string {
+	// Заголовки столбцов тоже подставляются: число из конфигурации сцены
+	// («не показано из 30») принадлежит шапке таблицы не меньше, чем ячейкам,
+	// и дублировать его руками значит однажды забыть.
+	titles := make([]string, len(t.Columns))
 	widths := make([]int, len(t.Columns))
 	for i, c := range t.Columns {
-		widths[i] = width(c.Title)
+		titles[i] = substitute(c.Title, fields...)
+		widths[i] = width(titles[i])
 	}
 	cells := make([][]string, len(t.Rows))
 	for ri, r := range t.Rows {
@@ -44,7 +49,7 @@ func renderTable(t Table, fields ...map[string]string) []string {
 		total -= 2
 	}
 
-	out := []string{header(t.Columns, widths)}
+	out := []string{header(titles, t.Columns, widths)}
 	for ri, r := range t.Rows {
 		if r.Rule {
 			out = append(out, strings.Repeat("─", total))
@@ -68,10 +73,10 @@ func renderTable(t Table, fields ...map[string]string) []string {
 	return out
 }
 
-func header(cols []Column, widths []int) string {
+func header(titles []string, cols []Column, widths []int) string {
 	var b strings.Builder
 	for i, c := range cols {
-		b.WriteString(cell(c.Title, widths[i], c.Right))
+		b.WriteString(cell(titles[i], widths[i], c.Right))
 		if i < len(cols)-1 {
 			b.WriteString("  ")
 		}

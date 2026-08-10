@@ -128,6 +128,8 @@ func main() {
 	mux.HandleFunc("POST /orders", a.handleCreateOrder)
 	mux.HandleFunc("GET /orders/{id}", a.handleGetOrder)
 	mux.HandleFunc("GET /catalog", a.handleCatalog)
+	mux.HandleFunc("GET /orders", a.handlePage)
+	mux.HandleFunc("POST /_lab/seed", a.handleSeed)
 	mux.HandleFunc("GET /_lab/events", a.rec.Handler())
 	mux.HandleFunc("POST /_lab/prepare", a.handlePrepare)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
