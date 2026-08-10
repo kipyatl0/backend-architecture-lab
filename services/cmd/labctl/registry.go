@@ -103,11 +103,35 @@ type ScriptConfig struct {
 	Prefetch       int     `json:"prefetch"`
 	Consumers      int     `json:"consumers"`
 	DieAfter       int     `json:"die_after"`
+	RestartMSValue int     `json:"restart_ms"`
 	DeliveryLimit  int     `json:"delivery_limit"`
 	PoisonOffset   int     `json:"poison_offset"`
-	Idempotent2    bool    `json:"idempotent_consumer"`
+	WindowMSValue  int     `json:"window_ms"`
+	IdempotentCons bool    `json:"idempotent_consumer"`
 	FailStep       string  `json:"fail_step"`
 	WorkMS         int     `json:"work_ms"`
+}
+
+// Значения по умолчанию у ручек обмена — не «на всякий случай», а часть
+// контракта: сцена задаёт только то, что для неё существенно, и в её сценарии
+// не заводится строк, которые ничего не решают.
+
+// RestartMS — через сколько умерший потребитель поднимается заново.
+func (c ScriptConfig) RestartMS() int {
+	if c.RestartMSValue <= 0 {
+		return 800
+	}
+	return c.RestartMSValue
+}
+
+// WindowMS — окно наблюдения там, где предмет сцены есть «что успело
+// произойти», а не «когда всё кончится». В сцене про отравленное сообщение
+// без предела повторов оно не кончится никогда.
+func (c ScriptConfig) WindowMS() int {
+	if c.WindowMSValue <= 0 {
+		return 4000
+	}
+	return c.WindowMSValue
 }
 
 // ── таблица замеров ─────────────────────────────────────────────────────────

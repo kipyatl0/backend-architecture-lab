@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-
 	"github.com/kipyatl0/backend-architecture-lab/services/internal/lab"
 )
 

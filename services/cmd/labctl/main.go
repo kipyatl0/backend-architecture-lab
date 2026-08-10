@@ -28,6 +28,8 @@ var drivers = map[string]func(context.Context, *Run) error{
 	"scene11": scene11,
 	"scene12": scene12,
 	"scene13": scene13,
+	"scene14": scene14,
+	"scene15": scene15,
 }
 
 func main() {

@@ -52,8 +52,8 @@ type config struct {
 
 	// Умереть после N-го обработанного сообщения, не подтвердив его. Не
 	// «сломаться» — именно умереть в самый обычный момент.
-	DieAfter   int `json:"die_after"`
-	RestartMS  int `json:"restart_ms"`
+	DieAfter   int  `json:"die_after"`
+	RestartMS  int  `json:"restart_ms"`
 	Idempotent bool `json:"idempotent"`
 	// Заказ, обработка которого не удаётся никогда. Одно такое сообщение и
 	// останавливает поток, пока у очереди нет предела повторных доставок.
@@ -374,13 +374,15 @@ func (a *app) consumeAMQP(ctx context.Context, cfg config, url string, log *slog
 		if !died || ctx.Err() != nil {
 			return
 		}
-		a.rec.Record("courier.restart", nil)
-		log.Info("потребитель поднялся заново")
+		// Запись о перезапуске делается ПОСЛЕ паузы: потребитель поднялся
+		// тогда, когда поднялся, а не тогда, когда решил подниматься.
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(time.Duration(cfg.RestartMS) * time.Millisecond):
 		}
+		a.rec.Record("courier.restart", nil)
+		log.Info("потребитель поднялся заново")
 	}
 }
 
@@ -430,10 +432,13 @@ func (a *app) pumpAMQP(ctx context.Context, cfg config, deliveries <-chan amqp.D
 					return
 				}
 				if !ok {
-					// Отравленное сообщение: возвращаем в очередь. Пока у
-					// очереди нет предела повторных доставок, оно вернётся
-					// в голову и встанет там намертво.
-					_ = d.Nack(false, true)
+					// Отравленное сообщение возвращаем в очередь — и именно
+					// basic.reject, а не basic.nack. Разница не косметическая:
+					// nack сообщает «не обработал», reject — «обработка не
+					// удалась», и счётчик доставок брокер увеличивает только
+					// на втором. С nack предел повторных доставок не сработал
+					// бы никогда, сколько его ни задавай.
+					_ = d.Reject(true)
 					return
 				}
 				_ = d.Ack(false)
@@ -456,12 +461,12 @@ func (a *app) consumeKafka(ctx context.Context, cfg config, brokers []string, lo
 		if !died || ctx.Err() != nil {
 			return
 		}
-		a.rec.Record("courier.restart", nil)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(time.Duration(cfg.RestartMS) * time.Millisecond):
 		}
+		a.rec.Record("courier.restart", nil)
 	}
 }
 

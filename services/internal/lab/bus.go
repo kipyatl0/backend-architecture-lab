@@ -40,8 +40,8 @@ const (
 // Msg — событие заказа. Факт в прошедшем времени: отправитель не знает, кто
 // на него подпишется, и ничего не ждёт в ответ.
 type Msg struct {
-	Type    string `json:"type"`     // order.paid, order.assigned, order.cancelled
-	Order   int64  `json:"order"`    // он же ключ партиционирования
+	Type    string `json:"type"`  // order.paid, order.assigned, order.cancelled
+	Order   int64  `json:"order"` // он же ключ партиционирования
 	Amount  int64  `json:"amount,omitempty"`
 	Client  string `json:"client,omitempty"`
 	Courier string `json:"courier,omitempty"`
@@ -127,9 +127,10 @@ func (a *AMQP) Channel() *amqp.Channel { return a.ch }
 // сценой целиком: стенд не копит сообщения между прогонами, иначе вывод
 // зависел бы от того, что студент запускал до этого.
 type Topology struct {
-	// Предел повторных доставок. 0 — предела нет: отравленное сообщение
-	// возвращается в голову очереди бесконечно, и поток стоит. Это первая
-	// половина сцены 15; вторая — тот же поток с пределом и очередью разбора.
+	// Предел повторных доставок. 0 — не задавать вовсе (RabbitMQ 4.x сам
+	// поставит 20), -1 — снять предел совсем, положительное число — задать.
+	// Снимать предел приходится явно: с версии 4.0 брокер защищается от
+	// бесконечного повтора по умолчанию, и «как было раньше» надо просить.
 	DeliveryLimit int
 	// Заводить ли очередь ручного разбора (сцена 21).
 	ManualReview bool
@@ -169,7 +170,7 @@ func (a *AMQP) Declare(t Topology) error {
 		"x-queue-type":           "quorum",
 		"x-dead-letter-exchange": DeadX,
 	}
-	if t.DeliveryLimit > 0 {
+	if t.DeliveryLimit != 0 {
 		args["x-delivery-limit"] = int32(t.DeliveryLimit)
 	}
 	if _, err := a.ch.QueueDeclare(QueueCour, true, false, false, false, args); err != nil {
