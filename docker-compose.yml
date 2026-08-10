@@ -6,15 +6,16 @@ name: backend-architecture-lab
 #   mono    m01–m03 l04   monolith, postgres, acquirer
 #   split   m03 l05–m04   + notifier: уведомления уехали за сеть
 #   net     m05           + toxiproxy: сеть можно рвать и замедлять
+#   broker  m06–m07       + rabbitmq, kafka, courier, orders, outbox-relay
+#   cdc     m07 l03       + debezium: события из журнала репликации
 #
-# Служба одна и та же во всех трёх профилях — меняется только то, где живёт
-# модуль уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же):
-# пусто — модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью,
-# которую сцена умеет портить.
+# Служба одна и та же во всех профилях — меняется только то, где живёт модуль
+# уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же): пусто —
+# модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью, которую
+# сцена умеет портить.
 #
-# Профили следующих модулей (broker, cdc, cluster, cache, scale, trace,
-# verify, trust) добавляются сюда по мере роста курса и не ломают сцены
-# предыдущих профилей.
+# Профили следующих модулей (cluster, cache, scale, trace, verify, trust)
+# добавляются сюда по мере роста курса и не ломают сцены предыдущих профилей.
 
 services:
 
@@ -22,7 +23,7 @@ services:
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono, split, net]
+    profiles: [mono, split, net, broker, cdc]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -30,8 +31,12 @@ services:
       # Сцены курса измеряются секундами, а не миллисекундами: fsync ничего
       # не доказывает, зато заметно шумит на ноутбуке.
       POSTGRES_INITDB_ARGS: "--data-checksums"
+    # wal_level=logical включён всегда, а не только в профиле cdc: иначе
+    # сцена 19 требовала бы перезапуска базы посреди курса, а разницы в
+    # наблюдаемом поведении остальных сцен от него нет.
     command: >
       postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+               -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
     volumes:
       # С 18 официальный образ держит данные в /var/lib/postgresql/<мажор>/docker,
       # а томом объявляет /var/lib/postgresql — монтируем именно его. При смене
@@ -52,7 +57,7 @@ services:
       context: ./services
       args:
         BIN: monolith
-    profiles: [mono, split, net]
+    profiles: [mono, split, net, broker]
     environment:
       LAB_SERVICE: monolith
       LAB_ADDR: ":8080"
@@ -87,7 +92,7 @@ services:
       context: ./services
       args:
         BIN: acquirer
-    profiles: [mono, split, net]
+    profiles: [mono, split, net, broker, cdc]
     environment:
       LAB_SERVICE: acquirer
       LAB_ADDR: ":8090"
@@ -107,10 +112,14 @@ services:
       context: ./services
       args:
         BIN: notifier
-    profiles: [split, net]
+    profiles: [split, net, broker, cdc]
     environment:
       LAB_SERVICE: notifier
       LAB_ADDR: ":8070"
+      # С m06 у уведомлений появляется второй вход: то же самое событие, но
+      # полученное от брокера, а не вызовом. Подписка включается сценой.
+      LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
+      LAB_KAFKA_BROKERS: kafka:9092
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8070/health"]
       interval: 2s
@@ -135,6 +144,188 @@ services:
       start_period: 2s
     mem_limit: 64m
 
+  # ── профиль broker: две модели обмена рядом ─────────────────────────────
+  # Очередь и лог стоят в одном профиле не для сравнения «что лучше», а
+  # потому что курс показывает их на одном и том же потоке событий: разница
+  # видна только тогда, когда поток один.
+
+  rabbitmq:
+    image: rabbitmq:4.3.4-management-alpine
+    profiles: [broker, cdc]
+    environment:
+      RABBITMQ_DEFAULT_USER: lab
+      RABBITMQ_DEFAULT_PASS: lab
+      # Порог памяти держим низким осознанно: сцена перегрузки должна упереться
+      # в брокер, а не в ноутбук студента.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+    mem_limit: 512m
+
+  kafka:
+    image: apache/kafka:4.3.1
+    profiles: [broker, cdc]
+    environment:
+      # KRaft: контроллер и брокер в одном узле, ZooKeeper не нужен.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      # Один узел — значит одна копия у всех служебных тем.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Группа не ждёт опоздавших: пауза перед перебалансировкой сделала бы
+      # каждую сцену на три секунды длиннее без единой новой мысли.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Темы создаёт сцена и только сцена: число партиций — предмет урока,
+      # автосоздание молча дало бы одну и сломало бы сцену 16.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - kafkadata:/var/lib/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+    mem_limit: 1024m
+
+  # Второй потребитель того же события: он и делает обмен веерным. Без него
+  # «одно событие — сколько угодно подписчиков» осталось бы словами.
+  courier:
+    image: ${LAB_REGISTRY}/courier:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: courier
+    profiles: [broker, cdc]
+    environment:
+      LAB_SERVICE: courier
+      LAB_ADDR: ":8060"
+      LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
+      LAB_KAFKA_BROKERS: kafka:9092
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8060/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 128m
+
+  # Заказы после выделения из монолита: своя база, свой исходящий ящик.
+  # Базу и схему сервис создаёт себе сам — иначе сцена m07 требовала бы от
+  # студента ./lab reset ровно один раз в жизни и молча ломалась без него.
+  orders:
+    image: ${LAB_REGISTRY}/orders:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: orders
+    profiles: [broker, cdc]
+    environment:
+      LAB_SERVICE: orders
+      LAB_ADDR: ":8050"
+      LAB_DATABASE_URL: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable
+      LAB_BOOTSTRAP_URL: postgres://delivery:delivery@postgres:5432/delivery?sslmode=disable
+      LAB_ACQUIRER_URL: http://acquirer:8090
+      LAB_COURIER_URL: http://courier:8060
+      LAB_NOTIFIER_URL: http://notifier:8070
+      LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
+      LAB_KAFKA_BROKERS: kafka:9092
+    # Сцены m07 роняют этот сервис намеренно: предмет урока — что осталось в
+    # базе и что не осталось в брокере, а не то, что стенд лежит.
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8050/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 256m
+
+  # Отправитель исходящего ящика. Отдельный процесс, а не горутина внутри
+  # заказов: иначе «ящик пережил смерть процесса» показать было бы нечем.
+  outbox-relay:
+    image: ${LAB_REGISTRY}/outbox-relay:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: outbox-relay
+    profiles: [broker, cdc]
+    environment:
+      LAB_SERVICE: outbox-relay
+      LAB_ADDR: ":8040"
+      LAB_DATABASE_URL: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable
+      LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
+      LAB_KAFKA_BROKERS: kafka:9092
+    restart: unless-stopped
+    depends_on:
+      orders:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8040/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 128m
+
+  # ── профиль cdc: события из журнала репликации ──────────────────────────
+  # Debezium публикуется на quay.io; копия на Docker Hub заброшена в 2024-м —
+  # версия оттуда была бы двухлетней давности.
+
+  debezium:
+    image: quay.io/debezium/connect:3.6.1.Final
+    profiles: [cdc]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: cdc
+      CONFIG_STORAGE_TOPIC: cdc-config
+      OFFSET_STORAGE_TOPIC: cdc-offsets
+      STATUS_STORAGE_TOPIC: cdc-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
+    mem_limit: 1024m
+
   # ── исполнитель сцен ────────────────────────────────────────────────────
   # Не сервис: поднимается на время одной сцены через `docker compose run`.
   # Живёт в своём профиле, чтобы `lab up <профиль>` его не запускал.
@@ -151,6 +342,12 @@ services:
       LAB_ACQUIRER_URL: http://acquirer:8090
       LAB_NOTIFIER_URL: http://notifier:8070
       LAB_TOXIPROXY_URL: http://toxiproxy:8474
+      LAB_COURIER_URL: http://courier:8060
+      LAB_ORDERS_URL: http://orders:8050
+      LAB_RELAY_URL: http://outbox-relay:8040
+      LAB_DEBEZIUM_URL: http://debezium:8083
+      LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
+      LAB_KAFKA_BROKERS: kafka:9092
       LAB_SCENES_DIR: /lab/scenes
       LAB_PROFILE: ${LAB_PROFILE:-}
     volumes:
@@ -160,3 +357,4 @@ services:
 
 volumes:
   pgdata:
+  kafkadata:

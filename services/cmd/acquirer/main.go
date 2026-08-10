@@ -20,6 +20,9 @@ type config struct {
 	// Умеет ли провайдер отбрасывать повтор по ключу идемпотентности.
 	// В сцене 1 — нет: ключа ему всё равно никто не передаёт.
 	Idempotent bool `json:"idempotent"`
+	// Возврат — такой же шаг, как и списание, и точно так же умеет не
+	// получиться. На этом стоит сцена 21: компенсация тоже не прошла.
+	RefundMode string `json:"refund_mode"`
 }
 
 type charge struct {
@@ -32,18 +35,25 @@ type charge struct {
 	Outcome        string    `json:"outcome"`
 }
 
+type refund struct {
+	Charge string    `json:"charge"`
+	Order  int64     `json:"order"`
+	At     time.Time `json:"at"`
+}
+
 type app struct {
-	mu     sync.Mutex
-	cfg    config
-	seq    int64
-	ledger []charge
-	byKey  map[string]string
+	mu      sync.Mutex
+	cfg     config
+	seq     int64
+	ledger  []charge
+	refunds []refund
+	byKey   map[string]string
 }
 
 func main() {
 	log := lab.Logger("acquirer")
 	a := &app{
-		cfg:   config{DelayMS: 0, Mode: "ok", Idempotent: false},
+		cfg:   config{DelayMS: 0, Mode: "ok", Idempotent: false, RefundMode: "ok"},
 		byKey: map[string]string{},
 	}
 
@@ -116,6 +126,34 @@ func main() {
 		}
 	})
 
+	// Возврат списания — компенсирующее действие саги. Отдельная операция, а
+	// не «откат»: у внешнего провайдера транзакции нет и быть не может.
+	mux.HandleFunc("POST /v1/refund", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Charge string `json:"charge"`
+			Order  int64  `json:"order"`
+		}
+		if err := lab.ReadJSON(r, &req); err != nil {
+			lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request"})
+			return
+		}
+		a.mu.Lock()
+		mode := a.cfg.RefundMode
+		a.mu.Unlock()
+
+		if mode != "ok" {
+			log.Info("возврат не прошёл", "order", req.Order, "charge", req.Charge)
+			lab.WriteJSON(w, http.StatusServiceUnavailable,
+				map[string]any{"code": "refund_failed", "error": "возврат не выполнен"})
+			return
+		}
+		a.mu.Lock()
+		a.refunds = append(a.refunds, refund{Charge: req.Charge, Order: req.Order, At: time.Now().UTC()})
+		a.mu.Unlock()
+		log.Info("возврат выполнен", "order", req.Order, "charge", req.Charge)
+		lab.WriteJSON(w, http.StatusOK, map[string]any{"charge": req.Charge, "status": "refunded"})
+	})
+
 	// ── управление сценой ───────────────────────────────────────────────────
 
 	mux.HandleFunc("POST /_lab/config", func(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +161,7 @@ func main() {
 			DelayMS    *int    `json:"delay_ms"`
 			Mode       *string `json:"mode"`
 			Idempotent *bool   `json:"idempotent"`
+			RefundMode *string `json:"refund_mode"`
 			Reset      bool    `json:"reset"`
 		}
 		if err := lab.ReadJSON(r, &req); err != nil {
@@ -139,10 +178,15 @@ func main() {
 		if req.Idempotent != nil {
 			a.cfg.Idempotent = *req.Idempotent
 		}
+		if req.RefundMode != nil {
+			a.cfg.RefundMode = *req.RefundMode
+		}
 		if req.Reset {
 			a.seq = 0
 			a.ledger = nil
+			a.refunds = nil
 			a.byKey = map[string]string{}
+			a.cfg.RefundMode = "ok"
 		}
 		cfg := a.cfg
 		a.mu.Unlock()
@@ -164,8 +208,11 @@ func main() {
 				total += c.Amount
 			}
 		}
+		refunds := make([]refund, len(a.refunds))
+		copy(refunds, a.refunds)
 		lab.WriteJSON(w, http.StatusOK, map[string]any{
 			"charges": out, "charged": charged, "charged_total": total,
+			"refunds": refunds, "refunded": len(refunds),
 		})
 	})
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+
 	"github.com/kipyatl0/backend-architecture-lab/services/internal/lab"
 )
 
@@ -25,6 +26,17 @@ type Run struct {
 	AcquirerURL  string
 	NotifierURL  string
 	ToxiproxyURL string
+	OrdersURL    string
+	CourierURL   string
+	RelayURL     string
+	DebeziumURL  string
+	AMQPURL      string
+	Brokers      []string
+
+	// С кого собираются наблюдения. До m06 сцену наблюдал один монолит; с
+	// появлением второго и третьего сервиса источников становится несколько,
+	// и сцена называет их сама.
+	Sources []string
 
 	ctl       *http.Client
 	own       lab.Recorder
@@ -35,19 +47,27 @@ type Run struct {
 }
 
 func newRun(scene Scene, script Script) *Run {
-	return &Run{
+	r := &Run{
 		Scene:        scene,
 		Script:       script,
 		MonolithURL:  lab.Env("LAB_MONOLITH_URL", "http://monolith:8080"),
 		AcquirerURL:  lab.Env("LAB_ACQUIRER_URL", "http://acquirer:8090"),
 		NotifierURL:  lab.Env("LAB_NOTIFIER_URL", "http://notifier:8070"),
 		ToxiproxyURL: lab.Env("LAB_TOXIPROXY_URL", "http://toxiproxy:8474"),
+		OrdersURL:    lab.Env("LAB_ORDERS_URL", "http://orders:8050"),
+		CourierURL:   lab.Env("LAB_COURIER_URL", "http://courier:8060"),
+		RelayURL:     lab.Env("LAB_RELAY_URL", "http://outbox-relay:8040"),
+		DebeziumURL:  lab.Env("LAB_DEBEZIUM_URL", "http://debezium:8083"),
+		AMQPURL:      lab.Env("LAB_AMQP_URL", "amqp://lab:lab@rabbitmq:5672/"),
+		Brokers:      strings.Split(lab.Env("LAB_KAFKA_BROKERS", "kafka:9092"), ","),
 		// Управляющий клиент — не участник сцены: его таймаут щедрый,
 		// иначе он сам стал бы источником отказа.
 		ctl:      &http.Client{Timeout: 60 * time.Second},
 		fields:   map[string]string{},
 		measured: map[string]map[string]float64{},
 	}
+	r.Sources = []string{r.MonolithURL}
+	return r
 }
 
 func (r *Run) Record(key string, fields map[string]string) { r.own.Record(key, fields) }
@@ -112,13 +132,17 @@ func (r *Run) getJSON(url string, out any) error {
 }
 
 func (r *Run) serviceEvents() ([]lab.Event, error) {
-	var body struct {
-		Events []lab.Event `json:"events"`
+	var all []lab.Event
+	for _, src := range r.Sources {
+		var body struct {
+			Events []lab.Event `json:"events"`
+		}
+		if err := r.getJSON(src+"/_lab/events", &body); err != nil {
+			return nil, err
+		}
+		all = append(all, body.Events...)
 	}
-	if err := r.getJSON(r.MonolithURL+"/_lab/events", &body); err != nil {
-		return nil, err
-	}
-	return body.Events, nil
+	return all, nil
 }
 
 func (r *Run) collect() error {

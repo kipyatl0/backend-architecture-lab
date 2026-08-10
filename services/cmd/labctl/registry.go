@@ -96,6 +96,18 @@ type ScriptConfig struct {
 	// порча сети
 	LatencyMS int `json:"latency_ms"`
 	CutAfterB int `json:"cut_after_bytes"`
+
+	// обмен сообщениями
+	Messages       int     `json:"messages"`
+	SecondPhaseAtS float64 `json:"second_phase_at_s"`
+	Prefetch       int     `json:"prefetch"`
+	Consumers      int     `json:"consumers"`
+	DieAfter       int     `json:"die_after"`
+	DeliveryLimit  int     `json:"delivery_limit"`
+	PoisonOffset   int     `json:"poison_offset"`
+	Idempotent2    bool    `json:"idempotent_consumer"`
+	FailStep       string  `json:"fail_step"`
+	WorkMS         int     `json:"work_ms"`
 }
 
 // ── таблица замеров ─────────────────────────────────────────────────────────
