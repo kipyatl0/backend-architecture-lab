@@ -169,6 +169,15 @@ func main() {
 			return
 		}
 		a.mu.Lock()
+		// Сброс идёт первым: сцена в одном вызове и обнуляет журнал, и задаёт
+		// поведение. Обратный порядок молча затирал бы заданное.
+		if req.Reset {
+			a.seq = 0
+			a.ledger = nil
+			a.refunds = nil
+			a.byKey = map[string]string{}
+			a.cfg.RefundMode = "ok"
+		}
 		if req.DelayMS != nil {
 			a.cfg.DelayMS = *req.DelayMS
 		}
@@ -180,13 +189,6 @@ func main() {
 		}
 		if req.RefundMode != nil {
 			a.cfg.RefundMode = *req.RefundMode
-		}
-		if req.Reset {
-			a.seq = 0
-			a.ledger = nil
-			a.refunds = nil
-			a.byKey = map[string]string{}
-			a.cfg.RefundMode = "ok"
 		}
 		cfg := a.cfg
 		a.mu.Unlock()

@@ -560,12 +560,18 @@ func (a *app) handle(cfg config, body []byte, msgID string, log *slog.Logger) bo
 	if cfg.WorkMS > 0 {
 		time.Sleep(time.Duration(cfg.WorkMS) * time.Millisecond)
 	}
+	// Время обработки, заказанное самим событием. Обработчиков может быть
+	// несколько — и тогда короткое событие закончится раньше длинного,
+	// сколько бы порядка ни обещал брокер.
+	if e.WorkMS > 0 {
+		time.Sleep(time.Duration(e.WorkMS) * time.Millisecond)
+	}
 
-	status := "assigned"
+	status := "paid"
 	switch e.Type {
 	case "order.cancelled":
 		status = "cancelled"
-	case "order.paid":
+	case "order.assigned":
 		status = "assigned"
 	}
 	name := a.apply(e.Order, status)

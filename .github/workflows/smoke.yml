@@ -12,7 +12,9 @@ on:
 jobs:
   scenes:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # С профилем broker сцен стало вдвое больше, и каждая поднимает свой
+    # профиль: двадцати минут уже не хватает.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +29,10 @@ jobs:
         run: |
           ./lab logs monolith || true
           ./lab logs acquirer || true
+          ./lab logs orders || true
+          ./lab logs courier || true
+          ./lab logs rabbitmq || true
+          ./lab logs kafka || true
 
       - name: погасить стенд
         if: always()

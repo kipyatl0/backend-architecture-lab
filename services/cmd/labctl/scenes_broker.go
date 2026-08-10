@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kipyatl0/backend-architecture-lab/services/internal/lab"
@@ -489,4 +490,525 @@ func scene15(ctx context.Context, r *Run) error {
 	r.Set("second_first", strconv.FormatInt(second, 10))
 	r.Set("second_last", strconv.FormatInt(second+int64(total)-1, 10))
 	return r.collect()
+}
+
+// ── сцена 16 — события применены не в том порядке (m06 l04) ─────────────────
+//
+// Брокер обещает порядок внутри партиции и обещание держит: все три события
+// заказа лежат в одной партиции подряд. Ломает порядок не он, а потребитель —
+// в тот момент, когда берётся за несколько сообщений сразу.
+func scene16(ctx context.Context, r *Run) error {
+	cfg := r.Script.Config
+	r.Sources = nil
+
+	if err := lab.WaitKafka(ctx, r.Brokers, 60*time.Second); err != nil {
+		return err
+	}
+
+	order := cfg.FirstOrderID
+	// Три события одного заказа. Время обработки убывает — и это не подгонка
+	// под результат: подтверждение оплаты дороже отметки об отмене почти в
+	// любой системе.
+	events := []struct {
+		Type   string
+		Seq    int
+		WorkMS int
+		Short  string
+	}{
+		{"order.paid", 1, 300, "paid"},
+		{"order.assigned", 2, 100, "assigned"},
+		{"order.cancelled", 3, 10, "cancelled"},
+	}
+
+	var natural []string
+	for _, e := range events {
+		natural = append(natural, e.Short)
+	}
+	r.Set("order", strconv.FormatInt(order, 10))
+	r.Set("natural", strings.Join(natural, " → "))
+	r.Set("parts", strconv.Itoa(lab.TopicParts))
+
+	// pass прогоняет один и тот же лог через потребителя с заданным числом
+	// обработчиков и возвращает порядок, в котором события были применены.
+	pass := func(workers int, group string) ([]string, string, error) {
+		if err := r.configureCourier(map[string]any{"reset": true, "source": "none"}); err != nil {
+			return nil, "", err
+		}
+		if err := lab.RecreateTopic(ctx, r.Brokers, lab.TopicParts); err != nil {
+			return nil, "", err
+		}
+		if err := r.configureOrders(map[string]any{"reset": true, "write_mode": "none"}); err != nil {
+			return nil, "", err
+		}
+		for _, e := range events {
+			if err := r.postJSON(r.OrdersURL+"/_lab/emit", map[string]any{
+				"type": e.Type, "order": order, "seq": e.Seq,
+				"work_ms": e.WorkMS, "target": "kafka",
+			}, nil); err != nil {
+				return nil, "", err
+			}
+		}
+		if err := r.configureCourier(map[string]any{
+			"source": "kafka", "group": group, "from_start": true,
+			"ack": "after", "workers": workers,
+		}); err != nil {
+			return nil, "", err
+		}
+		state, err := r.waitState(ctx, func(s courierState) bool {
+			return s.Processed >= int64(len(events))
+		}, 40*time.Second)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := r.configureCourier(map[string]any{"source": "none"}); err != nil {
+			return nil, "", err
+		}
+
+		var applied []string
+		for _, s := range state.Sequence {
+			parts := strings.SplitN(s, ":", 2)
+			if len(parts) == 2 {
+				applied = append(applied, parts[1])
+			}
+		}
+		final := ""
+		if len(applied) > 0 {
+			final = applied[len(applied)-1]
+		}
+		return applied, final, nil
+	}
+
+	r.T0 = time.Now()
+
+	applied, final, err := pass(1, "courier-one")
+	if err != nil {
+		return err
+	}
+	r.Set("one_applied", strings.Join(applied, " → "))
+	r.Set("one_final", final)
+	r.Measure("one", "correct", boolToFloat(final == events[len(events)-1].Short))
+
+	applied, final, err = pass(len(events)+1, "courier-many")
+	if err != nil {
+		return err
+	}
+	r.Set("many_applied", strings.Join(applied, " → "))
+	r.Set("many_final", final)
+	r.Set("workers", strconv.Itoa(len(events)+1))
+	r.Measure("many", "correct", boolToFloat(final == events[len(events)-1].Short))
+	return nil
+}
+
+func boolToFloat(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// ordersState — то, что сервис заказов видит у себя: свои заказы и свой
+// исходящий ящик. Чужих данных здесь нет и быть не может.
+type ordersState struct {
+	Orders []struct {
+		ID     int64  `json:"id"`
+		Status string `json:"status"`
+		Charge string `json:"charge"`
+	} `json:"orders"`
+	Outbox []struct {
+		ID    int64  `json:"id"`
+		Order int64  `json:"order"`
+		Type  string `json:"type"`
+		Sent  bool   `json:"sent"`
+	} `json:"outbox"`
+	Saga []string `json:"saga"`
+}
+
+func (r *Run) ordersState() (ordersState, error) {
+	var s ordersState
+	err := r.getJSON(r.OrdersURL+"/_lab/state", &s)
+	return s, err
+}
+
+// waitOrdersDown ждёт, пока сервис заказов действительно исчезнет. Без этого
+// шага сцена спрашивает «поднялся?» у процесса, который ещё не умирал, и
+// печатает подъём раньше смерти.
+func (r *Run) waitOrdersDown(ctx context.Context, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for {
+		if err := r.getJSON(r.OrdersURL+"/_lab/state", nil); err != nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("сервис заказов не умер за %s — сцена не сыграна", limit)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// waitOrdersUp ждёт, пока сервис заказов поднимется после смерти. Платформа
+// поднимает его сама — сцена только дожидается, как дождался бы дежурный.
+func (r *Run) waitOrdersUp(ctx context.Context, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for {
+		if err := r.getJSON(r.OrdersURL+"/_lab/state", nil); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("сервис заказов не поднялся за %s", limit)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// ── сцена 17 — двойная запись (m07 l01) ─────────────────────────────────────
+//
+// Запись в базу и отправка события — два разных действия с двумя разными
+// исходами. Между ними есть щель, и однажды процесс умирает именно в ней.
+// Никакой ошибки при этом не возникает: клиент получил ответ, база
+// зафиксирована, событие не ушло, и никто об этом не узнал.
+func scene17(ctx context.Context, r *Run) error {
+	cfg := r.Script.Config
+	r.Sources = nil
+
+	if err := r.configureCourier(map[string]any{"reset": true, "source": "none"}); err != nil {
+		return fmt.Errorf("курьеры не настроены — поднят ли профиль broker? %w", err)
+	}
+	if err := r.configureRelay(map[string]any{"reset": true, "enabled": false}); err != nil {
+		return fmt.Errorf("отправитель ящика не настроен: %w", err)
+	}
+	conn, err := lab.DialAMQPWait(ctx, r.AMQPURL, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.Declare(lab.Topology{}); err != nil {
+		return err
+	}
+	if err := r.configureOrders(map[string]any{
+		"reset": true, "write_mode": "direct", "target": "amqp",
+	}); err != nil {
+		return err
+	}
+	if err := r.prepareOrders(cfg.FirstOrderID); err != nil {
+		return err
+	}
+
+	total := cfg.Messages
+	if total == 0 {
+		total = 3
+	}
+	last := cfg.FirstOrderID + int64(total) - 1
+	r.Set("total", strconv.Itoa(total))
+	r.Set("first_order", strconv.FormatInt(cfg.FirstOrderID, 10))
+	r.Set("last_order", strconv.FormatInt(last, 10))
+	r.Set("good", strconv.Itoa(total-1))
+
+	// Потребитель работает всё это время: он и покажет, что до него дошло.
+	if err := r.configureCourier(map[string]any{"source": "amqp", "ack": "after"}); err != nil {
+		return err
+	}
+
+	r.T0 = time.Now()
+
+	// Обычные заказы: запись прошла, событие ушло, курьер назначен.
+	r.Record("orders.normal", nil)
+	if _, err := r.createOrders(total-1, cfg.Client, cfg.Restaurant, cfg.Amount); err != nil {
+		return err
+	}
+	if _, err := r.waitProcessed(ctx, int64(total-1), 20*time.Second); err != nil {
+		return err
+	}
+	r.Record("courier.normal", nil)
+
+	// Тот же самый заказ, но процесс умирает между фиксацией и отправкой.
+	r.SleepUntil(cfg.SecondPhaseAtS)
+	if err := r.configureOrders(map[string]any{"crash_after_commit": true}); err != nil {
+		return err
+	}
+	r.Record("client.last", nil)
+	if _, err := r.createOrders(1, cfg.Client, cfg.Restaurant, cfg.Amount); err != nil {
+		return err
+	}
+	if err := r.waitOrdersDown(ctx, 15*time.Second); err != nil {
+		return err
+	}
+	r.Record("orders.die", nil)
+
+	if err := r.waitOrdersUp(ctx, 60*time.Second); err != nil {
+		return err
+	}
+	r.Record("orders.up", nil)
+
+	// Даём потребителю столько же времени, сколько было у нормальных заказов:
+	// если бы событие ушло, оно бы уже дошло.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Duration(cfg.WindowMS()) * time.Millisecond):
+	}
+
+	state, err := r.courierState()
+	if err != nil {
+		return err
+	}
+	if err := r.configureCourier(map[string]any{"source": "none"}); err != nil {
+		return err
+	}
+	orders, err := r.ordersState()
+	if err != nil {
+		return err
+	}
+
+	r.Record("silence", nil)
+	r.Set("in_db", strconv.Itoa(len(orders.Orders)))
+	r.Set("delivered", strconv.FormatInt(state.Processed, 10))
+	r.Set("assigned", strconv.Itoa(len(state.Assignments)))
+	return r.collect()
+}
+
+// ── сцена 18 — исходящий ящик под тем же отказом (m07 l02) ──────────────────
+//
+// Тот же самый отказ, что и в сцене 17, и тот же самый момент смерти. Разница
+// одна: событие ложится в базу той же транзакцией, что и заказ. Оно переживает
+// смерть процесса — и приходит дважды, потому что «минимум один раз» никуда
+// не делось.
+func scene18(ctx context.Context, r *Run) error {
+	cfg := r.Script.Config
+	r.Sources = nil
+
+	if err := r.configureCourier(map[string]any{"reset": true, "source": "none"}); err != nil {
+		return fmt.Errorf("курьеры не настроены — поднят ли профиль broker? %w", err)
+	}
+	conn, err := lab.DialAMQPWait(ctx, r.AMQPURL, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.Declare(lab.Topology{}); err != nil {
+		return err
+	}
+	// Ящик пишется той же транзакцией, что и заказ: либо есть оба, либо нет
+	// ни того ни другого.
+	if err := r.configureOrders(map[string]any{"reset": true, "write_mode": "outbox"}); err != nil {
+		return err
+	}
+	if err := r.prepareOrders(cfg.FirstOrderID); err != nil {
+		return err
+	}
+	if err := r.configureRelay(map[string]any{
+		"reset": true, "enabled": true, "target": "amqp", "die_after_publish": false,
+	}); err != nil {
+		return fmt.Errorf("отправитель ящика не настроен: %w", err)
+	}
+	if err := r.configureCourier(map[string]any{"source": "amqp", "ack": "after"}); err != nil {
+		return err
+	}
+
+	total := cfg.Messages
+	if total == 0 {
+		total = 3
+	}
+	last := cfg.FirstOrderID + int64(total) - 1
+	r.Set("total", strconv.Itoa(total))
+	r.Set("first_order", strconv.FormatInt(cfg.FirstOrderID, 10))
+	r.Set("last_order", strconv.FormatInt(last, 10))
+	r.Set("good", strconv.Itoa(total-1))
+
+	r.T0 = time.Now()
+
+	r.Record("orders.normal", nil)
+	if _, err := r.createOrders(total-1, cfg.Client, cfg.Restaurant, cfg.Amount); err != nil {
+		return err
+	}
+	if _, err := r.waitProcessed(ctx, int64(total-1), 25*time.Second); err != nil {
+		return err
+	}
+	r.Record("courier.normal", nil)
+
+	// Тот же отказ, что и в прошлой сцене, плюс второй: отправитель ящика
+	// умирает между публикацией и отметкой.
+	r.SleepUntil(cfg.SecondPhaseAtS)
+	if err := r.configureRelay(map[string]any{"die_after_publish": true}); err != nil {
+		return err
+	}
+	if err := r.configureOrders(map[string]any{"crash_after_commit": true}); err != nil {
+		return err
+	}
+	r.Record("client.last", nil)
+	if _, err := r.createOrders(1, cfg.Client, cfg.Restaurant, cfg.Amount); err != nil {
+		return err
+	}
+	if err := r.waitOrdersDown(ctx, 15*time.Second); err != nil {
+		return err
+	}
+	r.Record("orders.die", nil)
+
+	// Событие пережило смерть владельца данных: оно лежит в его же базе, и
+	// отправитель ящика — отдельный процесс, которому эта смерть не помешала.
+	// Ждём доставку раньше, чем подъём: она и правда случается раньше.
+	state, err := r.waitState(ctx, func(s courierState) bool {
+		return s.Processed >= int64(total)
+	}, 40*time.Second)
+	if err != nil {
+		return err
+	}
+	r.Record("relay.delivered", nil)
+
+	// А теперь — цена приёма: отметка не пережила смерть отправителя, и то же
+	// событие уходит второй раз.
+	state, err = r.waitState(ctx, func(s courierState) bool {
+		return s.Processed >= int64(total+1)
+	}, 40*time.Second)
+	if err != nil {
+		return err
+	}
+	r.Record("relay.again", nil)
+
+	if err := r.waitOrdersUp(ctx, 60*time.Second); err != nil {
+		return err
+	}
+	r.Record("orders.up", nil)
+
+	if err := r.configureCourier(map[string]any{"source": "none"}); err != nil {
+		return err
+	}
+	orders, err := r.ordersState()
+	if err != nil {
+		return err
+	}
+	dup := 0
+	for _, a := range state.Assignments {
+		if a.Times > 1 {
+			dup++
+		}
+	}
+
+	r.Set("in_db", strconv.Itoa(len(orders.Orders)))
+	r.Set("in_outbox", strconv.Itoa(len(orders.Outbox)))
+	r.Set("delivered", strconv.FormatInt(state.Processed, 10))
+	r.Set("assigned", strconv.Itoa(len(state.Assignments)))
+	r.Set("dup_count", strconv.Itoa(dup))
+	return r.collect()
+}
+
+// runSagaScene — общая часть сцен 20 и 21. Отличаются они ровно одним: удаётся
+// ли компенсация. Всё остальное — тот же процесс, сломавшийся на том же шаге.
+func (r *Run) runSagaScene(ctx context.Context, refundMode string, manual bool) error {
+	cfg := r.Script.Config
+	// Наблюдатель — сервис заказов: он и есть оркестратор процесса, и журнал
+	// шагов ведёт он.
+	r.Sources = []string{r.OrdersURL}
+
+	if err := r.postJSON(r.AcquirerURL+"/_lab/config", map[string]any{
+		"delay_ms": 0, "mode": "ok", "idempotent": true,
+		"refund_mode": refundMode, "reset": true,
+	}, nil); err != nil {
+		return err
+	}
+	if err := r.postJSON(r.NotifierURL+"/_lab/config", map[string]any{
+		"mode": "ok", "strict": false, "reset": true,
+	}, nil); err != nil {
+		return err
+	}
+	conn, err := lab.DialAMQPWait(ctx, r.AMQPURL, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.Declare(lab.Topology{ManualReview: manual}); err != nil {
+		return err
+	}
+	if err := r.configureRelay(map[string]any{"reset": true, "enabled": false}); err != nil {
+		return err
+	}
+	// Курьеры отказывают на прямом шаге: свободных курьеров нет.
+	if err := r.configureCourier(map[string]any{
+		"reset": true, "source": "none", "assign_fail": true,
+	}); err != nil {
+		return err
+	}
+	if err := r.configureOrders(map[string]any{
+		"reset": true, "write_mode": "none", "saga": true, "compensate": true,
+	}); err != nil {
+		return err
+	}
+	if err := r.prepareOrders(cfg.FirstOrderID); err != nil {
+		return err
+	}
+
+	order := strconv.FormatInt(cfg.FirstOrderID, 10)
+	r.Set("order", order)
+	r.Set("amount", strconv.FormatInt(cfg.Amount, 10))
+	// Идентификатор списания приходит из журнала провайдера, а не выдумывается:
+	// в очередь ручного разбора уходит именно он.
+	r.Set("charge", "ch_1")
+
+	r.T0 = time.Now()
+	r.Record("client.call", nil)
+	if _, err := r.createOrders(1, cfg.Client, cfg.Restaurant, cfg.Amount); err == nil {
+		return fmt.Errorf("процесс должен был сломаться на назначении курьера, но прошёл целиком")
+	}
+	r.Record("client.recv", nil)
+
+	state, err := r.ordersState()
+	if err != nil {
+		return err
+	}
+	status := ""
+	for _, o := range state.Orders {
+		if strconv.FormatInt(o.ID, 10) == order {
+			status = o.Status
+		}
+	}
+	var ledger struct {
+		Charged  int `json:"charged"`
+		Refunded int `json:"refunded"`
+	}
+	if err := r.getJSON(r.AcquirerURL+"/_lab/ledger", &ledger); err != nil {
+		return err
+	}
+	var notif struct {
+		Received int64 `json:"received"`
+	}
+	if err := r.getJSON(r.NotifierURL+"/_lab/state", &notif); err != nil {
+		return err
+	}
+
+	r.Set("status", status)
+	r.Set("charges", strconv.Itoa(ledger.Charged))
+	r.Set("refunds", strconv.Itoa(ledger.Refunded))
+	r.Set("notifications", strconv.FormatInt(notif.Received, 10))
+
+	if manual {
+		pending, err := conn.Drain(lab.QueueManu)
+		if err != nil {
+			return err
+		}
+		r.Set("manual", strconv.Itoa(len(pending)))
+	}
+	return r.collect()
+}
+
+// ── сцена 20 — сага: шаг упал, компенсации пошли (m07 l04) ──────────────────
+//
+// Общей транзакции у четырёх участников нет и быть не может. Значит, отменять
+// сделанное приходится по одному действию за раз — и в обратном порядке.
+func scene20(ctx context.Context, r *Run) error {
+	return r.runSagaScene(ctx, "ok", false)
+}
+
+// ── сцена 21 — компенсация тоже не прошла (m07 l05) ─────────────────────────
+//
+// Компенсация — обычный вызов обычного сервиса, и отказывает она ровно так же,
+// как прямой шаг. Разница в том, что дальше отменять уже нечего.
+func scene21(ctx context.Context, r *Run) error {
+	return r.runSagaScene(ctx, "error", true)
 }

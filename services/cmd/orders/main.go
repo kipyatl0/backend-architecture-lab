@@ -101,6 +101,7 @@ func main() {
 	mux.HandleFunc("POST /orders", a.handleCreate)
 	mux.HandleFunc("POST /_lab/config", a.handleConfig)
 	mux.HandleFunc("POST /_lab/prepare", a.handlePrepare)
+	mux.HandleFunc("POST /_lab/emit", a.handleEmit)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
 
 	addr := lab.Env("LAB_ADDR", ":8050")
@@ -250,7 +251,10 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		a.rec.Record("orders.die", map[string]string{"order": strconv.FormatInt(id, 10)})
 		a.log.Info("процесс умер после фиксации и до отправки события", "order", id)
 		go func() {
-			time.Sleep(30 * time.Millisecond)
+			// Ответ клиенту должен успеть уйти, а сцена — успеть увидеть, что
+			// процесс действительно исчез. Тридцати миллисекунд на второе не
+			// хватало: сцена спрашивала «поднялся?» раньше, чем он умирал.
+			time.Sleep(150 * time.Millisecond)
 			os.Exit(1)
 		}()
 		lab.WriteJSON(w, http.StatusCreated, map[string]any{"order": id})
@@ -552,6 +556,37 @@ func (a *app) handlePrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lab.WriteJSON(w, http.StatusOK, map[string]any{"first_order_id": req.FirstOrderID})
+}
+
+// handleEmit отправляет названное сценой событие. Отправитель при этом
+// остаётся настоящим — сервис заказов, а не исполнитель сцены: иначе в timeline
+// пришлось бы писать неправду о том, кто это событие породил.
+func (a *app) handleEmit(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Type   string `json:"type"`
+		Order  int64  `json:"order"`
+		Seq    int    `json:"seq"`
+		WorkMS int    `json:"work_ms"`
+		Target string `json:"target"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Target == "" {
+		req.Target = "kafka"
+	}
+	msg := lab.Msg{
+		Type: req.Type, Order: req.Order, Seq: req.Seq, WorkMS: req.WorkMS,
+		ID: fmt.Sprintf("evt_%d_%d", req.Order, req.Seq),
+	}
+	if err := a.publish(r.Context(), req.Target, msg); err != nil {
+		lab.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	a.rec.Record(fmt.Sprintf("orders.emit#%d", req.Seq),
+		map[string]string{"order": strconv.FormatInt(req.Order, 10), "type": req.Type})
+	lab.WriteJSON(w, http.StatusOK, msg)
 }
 
 func (a *app) handleState(w http.ResponseWriter, r *http.Request) {

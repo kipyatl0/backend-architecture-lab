@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        bin: [monolith, acquirer, notifier, labctl]
+        bin: [monolith, acquirer, notifier, labctl, courier, orders, outbox-relay]
     steps:
       - uses: actions/checkout@v4
 
