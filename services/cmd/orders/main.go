@@ -53,6 +53,11 @@ type config struct {
 	// Где лежит кэш (m10 l01): shared — общая быстрая память, видная всем
 	// инстансам; local — память этого процесса, своя у каждого инстанса.
 	CacheMode string `json:"cache_mode"`
+
+	// Класть ли контекст трассировки в заголовки отправляемого сообщения
+	// (m11 l01). По HTTP контекст едет сам; через брокер — только если
+	// отправитель положил его туда руками. Ровно на этом решении и рвётся трейс.
+	Propagate bool `json:"propagate"`
 }
 
 func defaults() config {
@@ -60,7 +65,7 @@ func defaults() config {
 		WriteMode: "none", Target: "both", CrashAfterCommit: false,
 		Saga: false, FailStep: "", Compensate: true,
 		ReadFrom: "primary", CacheTTLMS: 2000, CardMS: 200, SingleFlight: false,
-		CacheMode: "shared",
+		CacheMode: "shared", Propagate: false,
 	}
 }
 
@@ -71,6 +76,10 @@ type app struct {
 	pool *pgxpool.Pool
 	log  *slog.Logger
 	rec  lab.Recorder
+	// Трассировка и лог с меткой трейса (m11). Выключены, пока стенду не задан
+	// приёмник: в профилях до m11 сервис ведёт себя в точности как раньше.
+	tracer *lab.Tracer
+	trail  *lab.Trail
 
 	acquirer string
 	courier  string
@@ -105,6 +114,8 @@ func main() {
 		cfg:      defaults(),
 		pool:     pool,
 		log:      log,
+		tracer:   lab.StartTracer("orders"),
+		trail:    lab.NewTrail("orders"),
 		acquirer: lab.Env("LAB_ACQUIRER_URL", "http://acquirer:8090"),
 		courier:  lab.Env("LAB_COURIER_URL", "http://courier:8060"),
 		notifier: lab.Env("LAB_NOTIFIER_URL", "http://notifier:8070"),
@@ -129,11 +140,13 @@ func main() {
 	mux.HandleFunc("GET /restaurants/{name}", a.handleCard)
 	mux.HandleFunc("GET /_lab/read-stats", a.handleReadStats)
 	mux.HandleFunc("POST /_lab/read-reset", a.handleReadReset)
+	mux.HandleFunc("GET /_lab/log", a.trail.Handler())
 
 	addr := lab.Env("LAB_ADDR", ":8050")
 	// Каждый ответ подписан именем инстанса: с m10 их больше одного, и вопрос
-	// «кто именно ответил» становится предметом урока.
-	if err := lab.Serve(addr, lab.WithInstance(mux), log, nil); err != nil {
+	// «кто именно ответил» становится предметом урока. Спан вокруг запроса —
+	// снаружи от всего остального: он обязан охватывать всю работу целиком.
+	if err := lab.Serve(addr, a.tracer.Middleware(lab.WithInstance(mux)), log, nil); err != nil {
 		log.Error("сервис остановлен с ошибкой", "err", err)
 	}
 }
@@ -262,9 +275,12 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		a.rec.Record("orders.committed", map[string]string{"order": strconv.FormatInt(id, 10)})
 
 	default: // none и direct пишут заказ обычной вставкой
-		if err := a.pool.QueryRow(ctx,
+		_, dbSpan := a.tracer.Start(ctx, "запись заказа", lab.KindClient)
+		err := a.pool.QueryRow(ctx,
 			`INSERT INTO orders (client, restaurant, amount, status) VALUES ($1,$2,$3,'paid') RETURNING id`,
-			req.Client, req.Restaurant, req.Amount).Scan(&id); err != nil {
+			req.Client, req.Restaurant, req.Amount).Scan(&id)
+		dbSpan.End()
+		if err != nil {
 			lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -272,6 +288,7 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		event.ID = fmt.Sprintf("evt_%d", id)
 		a.rec.Record("orders.committed", map[string]string{"order": strconv.FormatInt(id, 10)})
 	}
+	lab.SpanOf(ctx).Set("order", strconv.FormatInt(id, 10))
 
 	// Данные ресторана изменились, и инстанс, принявший запись, сбрасывает свою
 	// карточку. Свою — и только свою: до памяти соседнего процесса ему не
@@ -322,6 +339,7 @@ func (a *app) runSaga(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 	order := strconv.FormatInt(id, 10)
+	lab.SpanOf(ctx).Set("order", order)
 	a.step("заказ создан")
 	a.rec.Record("saga.created", map[string]string{"order": order})
 
@@ -345,9 +363,15 @@ func (a *app) runSaga(ctx context.Context, w http.ResponseWriter,
 	var charge struct {
 		Charge string `json:"charge"`
 	}
-	if err := a.postJSON(ctx, a.acquirer+"/v1/charge", map[string]any{
+	// Эквайринг за периметром: своих спанов он не заводит и заводить не обязан.
+	// Значит, отрезок за него заводит вызывающий — иначе в дереве трейса на
+	// месте внешнего вызова будет дыра.
+	chargeCtx, chargeSpan := a.tracer.Start(ctx, "списание в эквайринге", lab.KindClient)
+	err := a.postJSON(chargeCtx, a.acquirer+"/v1/charge", map[string]any{
 		"order": id, "amount": amount, "idempotency_key": fmt.Sprintf("order-%d", id),
-	}, &charge); err != nil {
+	}, &charge)
+	chargeSpan.End()
+	if err != nil {
 		fail("списание", err.Error())
 		return
 	}
@@ -382,6 +406,10 @@ func (a *app) runSaga(ctx context.Context, w http.ResponseWriter,
 	a.rec.Record("saga.assigned", map[string]string{"order": order})
 
 	_, _ = a.pool.Exec(ctx, `UPDATE orders SET status='assigned' WHERE id=$1`, id)
+	// Строка лога с меткой трассировки: третий сигнал. Метку она получает не
+	// от программиста, а из контекста запроса — тем и держится связь между
+	// логом, трейсом и числом в метрике.
+	a.trail.Write(ctx, "заказ оформлен", map[string]string{"заказ": order})
 	lab.WriteJSON(w, http.StatusCreated, map[string]any{"order": id, "status": "assigned"})
 }
 
@@ -458,12 +486,29 @@ func (a *app) step(text string) {
 // ── отправка события ────────────────────────────────────────────────────────
 
 func (a *app) publish(ctx context.Context, target string, e lab.Msg) error {
+	// Отправка события — своя работа со своей длительностью, и в дереве трейса
+	// она обязана быть отдельным отрезком: иначе «где ушло время» останется
+	// вопросом к сервису целиком.
+	ctx, span := a.tracer.Start(ctx, "публикация "+e.Type, lab.KindProducer)
+	defer span.End()
+	span.Set("order", strconv.FormatInt(e.Order, 10))
+
+	// Вот всё решение целиком. Положил контекст в заголовки — потребитель
+	// продолжит трейс; не положил — начнёт свой, и связи не будет ни у кого.
+	var headers map[string]string
+	if a.config().Propagate {
+		if tp := lab.Carrier(ctx); tp != "" {
+			headers = map[string]string{"traceparent": tp}
+			span.Set("propagated", "true")
+		}
+	}
+
 	if target == "amqp" || target == "both" {
 		conn, err := lab.DialAMQP(a.amqpURL)
 		if err != nil {
 			return err
 		}
-		err = conn.Publish(ctx, e.Type, e)
+		err = conn.PublishWithHeaders(ctx, e.Type, e, headers)
 		conn.Close()
 		if err != nil {
 			return err
@@ -474,7 +519,7 @@ func (a *app) publish(ctx context.Context, target string, e lab.Msg) error {
 		if err != nil {
 			return err
 		}
-		err = k.Produce(ctx, e)
+		err = k.ProduceWithHeaders(ctx, e, headers)
 		k.Close()
 		if err != nil {
 			return err
@@ -490,6 +535,9 @@ func (a *app) postJSON(ctx context.Context, url string, body, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Контекст трассировки уезжает заголовком в каждом исходящем вызове. Одна
+	// строка — и соседний сервис оказывается в том же трейсе.
+	lab.Inject(ctx, req.Header)
 	resp, err := a.http.Do(req)
 	if err != nil {
 		return err
@@ -532,6 +580,7 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		CardMS           *int    `json:"card_ms"`
 		SingleFlight     *bool   `json:"single_flight"`
 		CacheMode        *string `json:"cache_mode"`
+		Propagate        *bool   `json:"propagate"`
 		Reset            bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -577,10 +626,14 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if req.CacheMode != nil {
 		a.cfg.CacheMode = *req.CacheMode
 	}
+	if req.Propagate != nil {
+		a.cfg.Propagate = *req.Propagate
+	}
 	cfg := a.cfg
 	a.mu.Unlock()
 
 	if req.Reset {
+		a.trail.Clear()
 		a.read.localClear()
 		if _, err := a.pool.Exec(r.Context(), `TRUNCATE orders, outbox RESTART IDENTITY`); err != nil {
 			lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})

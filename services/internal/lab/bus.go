@@ -216,10 +216,22 @@ func (a *AMQP) Declare(t Topology) error {
 }
 
 func (a *AMQP) Publish(ctx context.Context, key string, e Msg) error {
+	return a.PublishWithHeaders(ctx, key, e, nil)
+}
+
+// PublishWithHeaders — то же самое, но с заголовками сообщения. Тело события
+// они не трогают: заголовок — это конверт, и всё техническое (метка
+// трассировки, версия схемы, время отправки) едет именно там.
+func (a *AMQP) PublishWithHeaders(ctx context.Context, key string, e Msg, headers map[string]string) error {
+	table := amqp.Table{}
+	for k, v := range headers {
+		table[k] = v
+	}
 	return a.ch.PublishWithContext(ctx, Exchange, key, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		MessageId:    e.ID,
 		DeliveryMode: amqp.Persistent,
+		Headers:      table,
 		Body:         e.Bytes(),
 	})
 }
@@ -350,11 +362,23 @@ func WaitKafka(ctx context.Context, brokers []string, wait time.Duration) error 
 }
 
 func (k *Kafka) Produce(ctx context.Context, e Msg) error {
-	return k.cl.ProduceSync(ctx, &kgo.Record{
+	return k.ProduceWithHeaders(ctx, e, nil)
+}
+
+// ProduceWithHeaders кладёт запись вместе с заголовками. У записи в логе они
+// такие же, как у сообщения в очереди: место для технического — того, что не
+// принадлежит событию, но нужно тому, кто его получит. Контекст трассировки
+// живёт здесь и только здесь, и решение положить его принимает отправитель.
+func (k *Kafka) ProduceWithHeaders(ctx context.Context, e Msg, headers map[string]string) error {
+	rec := &kgo.Record{
 		Topic: Topic,
 		Key:   []byte(e.Key()),
 		Value: e.Bytes(),
-	}).FirstErr()
+	}
+	for name, v := range headers {
+		rec.Headers = append(rec.Headers, kgo.RecordHeader{Key: name, Value: []byte(v)})
+	}
+	return k.cl.ProduceSync(ctx, rec).FirstErr()
 }
 
 // ProduceTo кладёт запись в названную партицию. Ключ при этом не трогается:

@@ -18,7 +18,7 @@ STATE_DIR="$LAB_DIR/.lab"
 PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
-KNOWN_PROFILES="mono split net broker cdc cluster cache scale"
+KNOWN_PROFILES="mono split net broker cdc cluster cache scale trace"
 
 # Где живёт модуль уведомлений в каждом профиле. Служба одна и та же — меняется
 # только это, и ровно из этого вырастают сцены m03 l05 и весь m05.
@@ -29,7 +29,18 @@ notifier_url() {
     net)    printf 'http://toxiproxy:8666' ;;    # за сетью, которую можно портить
     broker) printf 'http://notifier:8070' ;;     # рядом с брокером: вызовом ИЛИ подпиской
     cdc)    printf 'http://notifier:8070' ;;
+    trace)  printf 'http://notifier:8070' ;;
     *)      printf '' ;;
+  esac
+}
+
+# Куда сервисы отправляют спаны. Пусто во всех профилях до m11 — и тогда
+# трассировка выключена целиком: сервис не заводит спанов, не шлёт ничего и
+# ведёт себя ровно так же, как вёл в сценах предыдущих модулей.
+otlp_url() {
+  case "$1" in
+    trace) printf 'http://jaeger:4318/v1/traces' ;;
+    *)     printf '' ;;
   esac
 }
 
@@ -94,7 +105,7 @@ remember_profile() {
 labctl() {
   local profile; profile="$(current_profile)"
   LAB_PROFILE="$profile" LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
-  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" \
+  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" LAB_OTLP_URL="$(otlp_url "$profile")" \
     compose --profile cli run --rm --no-deps -T labctl "$@"
 }
 
@@ -111,7 +122,7 @@ raise() {
   say "Поднимаю профиль $profile…"
   # Смена профиля меняет окружение монолита — Compose пересоздаёт контейнер сам.
   LAB_NOTIFIER_URL="$(notifier_url "$profile")" \
-  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" \
+  LAB_KAFKA_BROKERS="$(kafka_brokers "$profile")" LAB_OTLP_URL="$(otlp_url "$profile")" \
     compose --profile "$profile" up -d --wait >&2
   remember_profile "$profile"
 }
@@ -194,6 +205,7 @@ lab — стенд курса «Архитектура бэкенда: расп�
   cluster брокер из трёх узлов и вторая копия базы: кворум, ISR, отставание
   cache   быстрая память рядом с базой: проекция, кэш, аренда блокировки
   scale   два инстанса службы и балансировщик перед ними: L4 против L7
+  trace   сквозной контекст запроса и приёмник трейсов: интерфейс на 16686
 TXT
 }
 

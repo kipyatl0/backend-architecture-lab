@@ -63,6 +63,11 @@ type config struct {
 	AssignFail bool `json:"assign_fail"`
 	// Отмена назначения (компенсация) отказывает.
 	CompensateFail bool `json:"compensate_fail"`
+
+	// Звать ли уведомления после назначения (m11 l01). Третий участник нужен,
+	// чтобы стало видно: за брокером трейс рвётся, а дальше по HTTP снова
+	// склеивается сам собой.
+	Notify bool `json:"notify"`
 }
 
 func defaults() config {
@@ -70,7 +75,7 @@ func defaults() config {
 		Source: "none", Group: "courier", FromStart: true,
 		Ack: "after", Prefetch: 1, Workers: 1, WorkMS: 0,
 		DieAfter: 0, RestartMS: 1000, Idempotent: false, PoisonOrder: 0,
-		AssignFail: false, CompensateFail: false,
+		AssignFail: false, CompensateFail: false, Notify: false,
 	}
 }
 
@@ -102,6 +107,10 @@ type app struct {
 
 	rec lab.Recorder
 
+	tracer   *lab.Tracer
+	notifier string
+	httpc    *http.Client
+
 	// Управление подпиской: сцена включает и выключает потребителя целиком.
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -110,9 +119,12 @@ type app struct {
 func main() {
 	log := lab.Logger("courier")
 	a := &app{
-		assign: map[int64]*assignment{},
-		status: map[int64]string{},
-		seen:   map[string]bool{},
+		assign:   map[int64]*assignment{},
+		status:   map[int64]string{},
+		seen:     map[string]bool{},
+		tracer:   lab.StartTracer("courier"),
+		notifier: lab.Env("LAB_NOTIFIER_URL", "http://notifier:8070"),
+		httpc:    &http.Client{Timeout: 30 * time.Second},
 	}
 	a.setConfig(defaults())
 
@@ -141,6 +153,9 @@ func main() {
 				map[string]string{"code": "no_courier", "error": "свободных курьеров нет"})
 			return
 		}
+		// В дереве трейса студент должен видеть работу, а не адрес служебной
+		// ручки стенда: имя спана здесь задаёт обработчик, а не путь запроса.
+		lab.SpanOf(r.Context()).Rename("назначение курьера")
 		name := a.apply(req.Order, "assigned")
 		log.Info("курьер назначен", "order", req.Order, "courier", name)
 		lab.WriteJSON(w, http.StatusOK, map[string]any{"order": req.Order, "courier": name})
@@ -189,6 +204,7 @@ func main() {
 			PoisonOrder    *int64  `json:"poison_order"`
 			AssignFail     *bool   `json:"assign_fail"`
 			CompensateFail *bool   `json:"compensate_fail"`
+			Notify         *bool   `json:"notify"`
 			Reset          bool    `json:"reset"`
 		}
 		if err := lab.ReadJSON(r, &req); err != nil {
@@ -227,6 +243,7 @@ func main() {
 		setBool(&a.cfg.Idempotent, req.Idempotent)
 		setBool(&a.cfg.AssignFail, req.AssignFail)
 		setBool(&a.cfg.CompensateFail, req.CompensateFail)
+		setBool(&a.cfg.Notify, req.Notify)
 		if req.PoisonOrder != nil {
 			a.cfg.PoisonOrder = *req.PoisonOrder
 		}
@@ -268,7 +285,7 @@ func main() {
 	})
 
 	addr := lab.Env("LAB_ADDR", ":8060")
-	if err := lab.Serve(addr, mux, log, a.stopConsumer); err != nil {
+	if err := lab.Serve(addr, a.tracer.Middleware(mux), log, a.stopConsumer); err != nil {
 		log.Error("сервис остановлен с ошибкой", "err", err)
 	}
 }
@@ -386,6 +403,26 @@ func (a *app) consumeAMQP(ctx context.Context, cfg config, url string, log *slog
 	}
 }
 
+// amqpContext и kafkaContext достают контекст трассировки из заголовков
+// доставки. Потребитель ничего не решает: он берёт то, что положил отправитель,
+// а если тот не положил ничего — работает без контекста и об этом не узнаёт.
+
+func amqpContext(ctx context.Context, d amqp.Delivery) context.Context {
+	if v, ok := d.Headers["traceparent"].(string); ok {
+		return lab.WithCarrier(ctx, v)
+	}
+	return ctx
+}
+
+func kafkaContext(ctx context.Context, r *kgo.Record) context.Context {
+	for _, h := range r.Headers {
+		if h.Key == "traceparent" {
+			return lab.WithCarrier(ctx, string(h.Value))
+		}
+	}
+	return ctx
+}
+
 // pumpAMQP возвращает true, если потребитель «умер» и его надо поднять заново.
 func (a *app) pumpAMQP(ctx context.Context, cfg config, deliveries <-chan amqp.Delivery,
 	handled *int, log *slog.Logger) bool {
@@ -409,7 +446,7 @@ func (a *app) pumpAMQP(ctx context.Context, cfg config, deliveries <-chan amqp.D
 			// Смерть до подтверждения. Сообщение уже обработано — но брокер
 			// об этом не знает и выдаст его снова: это и есть «минимум один раз».
 			if cfg.DieAfter > 0 && *handled == cfg.DieAfter {
-				a.handle(cfg, d.Body, d.MessageId, log)
+				a.handle(amqpContext(ctx, d), cfg, d.Body, d.MessageId, log)
 				a.rec.Record("courier.die", map[string]string{"handled": fmt.Sprint(*handled)})
 				log.Info("потребитель умер, не подтвердив сообщение", "handled", *handled)
 				return true
@@ -427,7 +464,7 @@ func (a *app) pumpAMQP(ctx context.Context, cfg config, deliveries <-chan amqp.D
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				ok := a.handle(cfg, d.Body, d.MessageId, log)
+				ok := a.handle(amqpContext(ctx, d), cfg, d.Body, d.MessageId, log)
 				if cfg.Ack == "before" {
 					return
 				}
@@ -501,7 +538,7 @@ func (a *app) pumpKafka(ctx context.Context, cfg config, k *lab.Kafka, handled *
 			*handled++
 			if cfg.DieAfter > 0 && *handled == cfg.DieAfter {
 				wg.Wait()
-				a.handle(cfg, r.Value, string(r.Key), log)
+				a.handle(kafkaContext(ctx, r), cfg, r.Value, string(r.Key), log)
 				a.rec.Record("courier.die", map[string]string{"handled": fmt.Sprint(*handled)})
 				log.Info("потребитель умер, не сдвинув смещение", "handled", *handled)
 				return true
@@ -511,7 +548,7 @@ func (a *app) pumpKafka(ctx context.Context, cfg config, k *lab.Kafka, handled *
 			go func(r *kgo.Record) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				a.handle(cfg, r.Value, string(r.Key), log)
+				a.handle(kafkaContext(ctx, r), cfg, r.Value, string(r.Key), log)
 			}(r)
 		}
 		wg.Wait()
@@ -527,12 +564,21 @@ func (a *app) pumpKafka(ctx context.Context, cfg config, k *lab.Kafka, handled *
 
 // handle — собственно обработка. Возвращает false, если сообщение обработать
 // не удалось.
-func (a *app) handle(cfg config, body []byte, msgID string, log *slog.Logger) bool {
+//
+// ctx приносит контекст трассировки — тот, что приехал в заголовках сообщения.
+// Если отправитель его туда не положил, ctx пуст, и спан ниже начнёт новый
+// трейс: никакой ошибки при этом не произойдёт, просто связь с породившим
+// запросом исчезнет навсегда.
+func (a *app) handle(ctx context.Context, cfg config, body []byte, msgID string, log *slog.Logger) bool {
 	e, err := lab.ParseMsg(body)
 	if err != nil {
 		a.failed.Add(1)
 		return false
 	}
+
+	ctx, span := a.tracer.Start(ctx, "обработка "+e.Type, lab.KindConsumer)
+	defer span.End()
+	span.Set("order", e.Key())
 	if cfg.PoisonOrder != 0 && e.Order == cfg.PoisonOrder {
 		a.failed.Add(1)
 		a.rec.Record("courier.poison", map[string]string{"order": e.Key()})
@@ -574,12 +620,42 @@ func (a *app) handle(cfg config, body []byte, msgID string, log *slog.Logger) bo
 	case "order.assigned":
 		status = "assigned"
 	}
+	_, assignSpan := a.tracer.Start(ctx, "назначение курьера", lab.KindInternal)
 	name := a.apply(e.Order, status)
+	assignSpan.Set("courier", name)
+	assignSpan.End()
+
 	a.processed.Add(1)
 	a.rec.Record(fmt.Sprintf("courier.handled#%d", a.processed.Load()),
 		map[string]string{"order": e.Key(), "courier": name, "type": e.Type})
 	log.Info("событие обработано", "order", e.Order, "type", e.Type, "courier", name)
+
+	// Третий участник цепочки. Вызов обычный, по HTTP, — и контекст в него
+	// уезжает сам: сервису уведомлений не пришлось ничего для этого делать.
+	if cfg.Notify {
+		a.notify(ctx, e.Order, log)
+	}
 	return true
+}
+
+// notify — обычный синхронный вызов соседнего сервиса. Нужен ровно затем,
+// чтобы за брокером в трейсе оказался не один сервис, а два: тогда видно, что
+// разрыв случился именно на брокере, а дальше всё склеилось само.
+func (a *app) notify(ctx context.Context, order int64, log *slog.Logger) {
+	body := fmt.Sprintf(`{"order":%d,"body":"Курьер назначен"}`, order)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.notifier+"/notifications",
+		strings.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	lab.Inject(ctx, req.Header)
+	resp, err := a.httpc.Do(req)
+	if err != nil {
+		log.Info("уведомление не отправлено", "order", order, "err", err.Error())
+		return
+	}
+	resp.Body.Close()
 }
 
 func max(a, b int) int {

@@ -11,14 +11,15 @@ name: backend-architecture-lab
 #   cluster m08           kafka ×3 и реплика базы: кворум, ISR, отставание
 #   cache   m09           + redis: проекция, кэш, распределённая блокировка
 #   scale   m10           второй инстанс заказов и балансировщик перед ними
+#   trace   m11           + jaeger: сквозной контекст, трейсы, разрыв на брокере
 #
 # Служба одна и та же во всех профилях — меняется только то, где живёт модуль
 # уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же): пусто —
 # модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью, которую
 # сцена умеет портить.
 #
-# Профили следующих модулей (trace, verify, trust) добавляются сюда по мере
-# роста курса и не ломают сцены предыдущих профилей.
+# Профили следующих модулей (verify, trust) добавляются сюда по мере роста
+# курса и не ломают сцены предыдущих профилей.
 
 services:
 
@@ -26,7 +27,7 @@ services:
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono, split, net, broker, cdc, cluster, cache, scale]
+    profiles: [mono, split, net, broker, cdc, cluster, cache, scale, trace]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -100,7 +101,7 @@ services:
       context: ./services
       args:
         BIN: acquirer
-    profiles: [mono, split, net, broker, cdc]
+    profiles: [mono, split, net, broker, cdc, trace]
     environment:
       LAB_SERVICE: acquirer
       LAB_ADDR: ":8090"
@@ -120,7 +121,7 @@ services:
       context: ./services
       args:
         BIN: notifier
-    profiles: [split, net, broker, cdc]
+    profiles: [split, net, broker, cdc, trace]
     environment:
       LAB_SERVICE: notifier
       LAB_ADDR: ":8070"
@@ -128,6 +129,10 @@ services:
       # полученное от брокера, а не вызовом. Подписка включается сценой.
       LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
       LAB_KAFKA_BROKERS: kafka:9092
+      # Куда сервис отправляет свои спаны. Пусто — трассировка выключена вовсе,
+      # и сервис ведёт себя ровно как в профилях до m11. Значение подставляет
+      # `lab` по имени профиля.
+      LAB_OTLP_URL: ${LAB_OTLP_URL:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8070/health"]
       interval: 2s
@@ -176,7 +181,7 @@ services:
 
   kafka:
     image: apache/kafka:4.3.1
-    profiles: [broker, cdc, cache]
+    profiles: [broker, cdc, cache, trace]
     environment:
       # KRaft: контроллер и брокер в одном узле, ZooKeeper не нужен.
       KAFKA_NODE_ID: 1
@@ -220,15 +225,24 @@ services:
       context: ./services
       args:
         BIN: courier
-    profiles: [broker, cdc]
+    profiles: [broker, cdc, trace]
     environment:
       LAB_SERVICE: courier
       LAB_ADDR: ":8060"
       LAB_AMQP_URL: amqp://lab:lab@rabbitmq:5672/
       LAB_KAFKA_BROKERS: kafka:9092
+      # С m11 у курьеров появляется третий участник цепочки: после назначения
+      # они зовут уведомления обычным вызовом. Включает это сцена.
+      LAB_NOTIFIER_URL: http://notifier:8070
+      LAB_OTLP_URL: ${LAB_OTLP_URL:-}
+    # Очередь в профиле trace не поднимается — там предмет не в моделях обмена,
+    # а в сквозном контексте. `required: false` означает «дождись, если этот
+    # сервис вообще есть в профиле»: без него профиль без RabbitMQ просто не
+    # собрался бы.
     depends_on:
       rabbitmq:
         condition: service_healthy
+        required: false
       kafka:
         condition: service_healthy
     healthcheck:
@@ -248,7 +262,7 @@ services:
       context: ./services
       args:
         BIN: orders
-    profiles: [broker, cdc, cluster, cache, scale]
+    profiles: [broker, cdc, cluster, cache, scale, trace]
     environment: &orders-env
       LAB_SERVICE: orders
       # Как этот инстанс называет себя в ответе (заголовок X-Lab-Instance).
@@ -272,6 +286,7 @@ services:
       # Куда публиковать: один узел в m06–m07, три в m08. Значение подставляет
       # `lab` по имени профиля.
       LAB_KAFKA_BROKERS: ${LAB_KAFKA_BROKERS:-kafka:9092}
+      LAB_OTLP_URL: ${LAB_OTLP_URL:-}
     # Сцены m07 роняют этот сервис намеренно: предмет урока — что осталось в
     # базе и что не осталось в брокере, а не то, что стенд лежит.
     restart: unless-stopped
@@ -499,6 +514,32 @@ services:
       start_period: 2s
     mem_limit: 128m
 
+  # ── профиль trace: куда стекаются спаны ─────────────────────────────────
+  # Приёмник и хранилище трейсов в одном контейнере. Вторая линейка Jaeger:
+  # она принимает OTLP — тот же протокол, на котором говорят все языки, — и
+  # отдаёт собранный трейс запросом, поэтому сцена печатает ровно то дерево,
+  # которое студент видит в интерфейсе на 16686.
+  #
+  # Хранилище — в памяти, по умолчанию. Трейсы живут ровно одну сцену, и
+  # переживать перезапуск им незачем.
+
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    profiles: [trace]
+    ports:
+      # Интерфейс: единственный порт стенда, который студент открывает в
+      # браузере. Всё остальное сцена делает за него.
+      - "16686:16686"
+    healthcheck:
+      # Своя проверка здоровья на 13133 — та же, которой пользуется любой
+      # приёмник OTLP. Она отвечает раньше, чем поднимается интерфейс.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:13133/status"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    mem_limit: 512m
+
   # ── исполнитель сцен ────────────────────────────────────────────────────
   # Не сервис: поднимается на время одной сцены через `docker compose run`.
   # Живёт в своём профиле, чтобы `lab up <профиль>` его не запускал.
@@ -538,6 +579,9 @@ services:
       LAB_PRIMARY_DSN: postgres://delivery:delivery@postgres:5432/orders?sslmode=disable
       LAB_REPLICA_DSN: postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable
       LAB_REDIS_ADDR: redis:6379
+      # Где спрашивать собранные трейсы. Сцена достаёт дерево тем же запросом,
+      # каким его достаёт интерфейс на 16686, — и печатает то же самое.
+      LAB_JAEGER_URL: http://jaeger:16686
       # Имя проекта Compose: по нему сцена находит контейнеры узлов, чтобы
       # ронять и поднимать их. Совпадает с `name:` в начале файла.
       LAB_COMPOSE_PROJECT: backend-architecture-lab

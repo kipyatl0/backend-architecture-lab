@@ -132,7 +132,7 @@ func verifyTable(t Table, measured map[string]map[string]float64) ([]string, []s
 						"%s: сценарий %.1f, наблюдение %.1f (допуск ±%.1f)", name, c.Value, got, tol))
 				}
 			}
-			chrono = append(chrono, fmt.Sprintf("  %sсценарий %8.1f   наблюдение %8.1f",
+			chrono = append(chrono, fmt.Sprintf("  %sсценарий %8.3f   наблюдение %8.3f",
 				pad(name, 30), c.Value, got))
 		}
 	}

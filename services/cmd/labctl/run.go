@@ -41,7 +41,10 @@ type Run struct {
 	PrimaryDSN string
 	ReplicaDSN string
 	RedisAddr  string
-	Docker     *lab.Docker
+	// Профиль trace: приёмник трейсов. Сцена достаёт из него дерево тем же
+	// запросом, каким его достаёт интерфейс.
+	JaegerURL string
+	Docker    *lab.Docker
 
 	// С кого собираются наблюдения. До m06 сцену наблюдал один монолит; с
 	// появлением второго и третьего сервиса источников становится несколько,
@@ -76,6 +79,7 @@ func newRun(scene Scene, script Script) *Run {
 		PrimaryDSN:   lab.Env("LAB_PRIMARY_DSN", "postgres://delivery:delivery@postgres:5432/orders?sslmode=disable"),
 		ReplicaDSN:   lab.Env("LAB_REPLICA_DSN", "postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable"),
 		RedisAddr:    lab.Env("LAB_REDIS_ADDR", "redis:6379"),
+		JaegerURL:    lab.Env("LAB_JAEGER_URL", "http://jaeger:16686"),
 		Docker:       lab.NewDocker(lab.Env("LAB_COMPOSE_PROJECT", "backend-architecture-lab")),
 		// Управляющий клиент — не участник сцены: его таймаут щедрый,
 		// иначе он сам стал бы источником отказа.
@@ -256,13 +260,26 @@ func (r *Run) tail(b *strings.Builder, explain bool, chrono []string) {
 }
 
 func (r *Run) reportTable(explain bool) (string, []string) {
-	problems, chrono := verifyTable(r.Script.Table, r.measured)
+	tables := r.Script.Tables
+	if len(tables) == 0 {
+		tables = []Table{r.Script.Table}
+	}
 
+	var problems, chrono []string
 	var b strings.Builder
 	r.head(&b)
-	b.WriteString("\n")
-	for _, line := range renderTable(r.Script.Table, r.fields, r.Script.Fields) {
-		b.WriteString(line + "\n")
+	for _, t := range tables {
+		p, c := verifyTable(t, r.measured)
+		problems = append(problems, p...)
+		chrono = append(chrono, c...)
+
+		b.WriteString("\n")
+		if t.Title != "" {
+			b.WriteString(substitute(t.Title, r.fields, r.Script.Fields) + "\n\n")
+		}
+		for _, line := range renderTable(t, r.fields, r.Script.Fields) {
+			b.WriteString(line + "\n")
+		}
 	}
 	if s := substitute(r.Script.Summary, r.fields, r.Script.Fields); s != "" {
 		b.WriteString(s + "\n")
