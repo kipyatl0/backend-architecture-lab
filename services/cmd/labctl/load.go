@@ -16,9 +16,14 @@ import (
 // Одна сцена — одна команда, и лишний сервис в кадре студенту ничего не
 // объясняет.
 //
-// Модель подачи — открытая: заявки приходят по расписанию и не ждут, пока
-// освободится предыдущая. Это принципиально. В закрытой модели (N клиентов
-// по кругу) очередь не растёт никогда, и закон Литтла показать нечем.
+// Модель подачи по умолчанию — открытая: заявки приходят по расписанию и не
+// ждут, пока освободится предыдущая. Это принципиально. В закрытой модели
+// (N клиентов по кругу) очередь не растёт никогда, и закон Литтла показать
+// нечем — поэтому все сцены до m12 подают поток именно так.
+//
+// Закрытая модель живёт рядом (loadClosed) и введена ровно затем, чтобы её
+// можно было сравнить с открытой на одной и той же службе: сцена 36 показывает,
+// что две модели дают противоположные ответы на один и тот же вопрос.
 
 type loadStats struct {
 	Sent     int
@@ -32,6 +37,37 @@ type loadStats struct {
 // Разница между Failed и Refused — это разница между «работу могли начать и
 // потеряли» и «работу не приняли». Для клиента это два разных мира, и сцена
 // про остановку сервиса держится ровно на ней.
+
+// observe — единственное место, где исход запроса превращается в счётчик.
+// Обе модели подачи считают одинаково: иначе их числа нельзя было бы класть
+// в одну таблицу, а вся сцена 36 состоит именно из этого сравнения.
+func (s *loadStats) observe(code int, err error, took time.Duration) {
+	s.Sent++
+	switch {
+	case err != nil && errors.Is(err, syscall.ECONNREFUSED):
+		s.Refused++
+	case err != nil:
+		s.Failed++
+	case code == http.StatusServiceUnavailable:
+		s.Rejected++
+		s.Lat = append(s.Lat, took)
+	case code >= 200 && code < 400:
+		s.OK++
+		s.Lat = append(s.Lat, took)
+	default:
+		s.Failed++
+	}
+}
+
+// errorPct — доля запросов, на которые клиент не получил ответа по существу.
+// Отказ на границе очереди считается наравне с обрывом: обещание «отказов не
+// больше стольких-то процентов» дают клиенту, а ему всё равно, почему ответа нет.
+func (s loadStats) errorPct() float64 {
+	if s.Sent == 0 {
+		return 0
+	}
+	return float64(s.Rejected+s.Failed+s.Refused) / float64(s.Sent) * 100
+}
 
 func (s loadStats) p(q float64) float64 {
 	if len(s.Lat) == 0 {
@@ -109,21 +145,7 @@ loop:
 
 			mu.Lock()
 			defer mu.Unlock()
-			stats.Sent++
-			switch {
-			case err != nil && errors.Is(err, syscall.ECONNREFUSED):
-				stats.Refused++
-			case err != nil:
-				stats.Failed++
-			case code == http.StatusServiceUnavailable:
-				stats.Rejected++
-				stats.Lat = append(stats.Lat, took)
-			case code >= 200 && code < 400:
-				stats.OK++
-				stats.Lat = append(stats.Lat, took)
-			default:
-				stats.Failed++
-			}
+			stats.observe(code, err, took)
 		}()
 	}
 
@@ -135,6 +157,54 @@ loop:
 	case <-done:
 	case <-time.After(timeout + 5*time.Second):
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	out := stats
+	out.Lat = append([]time.Duration(nil), stats.Lat...)
+	return out
+}
+
+// loadClosed подаёт нагрузку по закрытой модели: clients клиентов ходят по
+// кругу и следующий запрос отправляют, только получив ответ на предыдущий.
+// Расписания здесь нет вовсе — темп задаёт сама служба, и очередь перед
+// обработчиками не может стать длиннее, чем клиентов.
+//
+// Отсюда её главное свойство и главная ловушка: сколько бы служба ни тормозила,
+// поток притормозит вместе с ней. Закрытая модель отвечает на вопрос «что видят
+// эти N клиентов», а не на вопрос «что будет, если придут все» — и подменять
+// вторым первое значит проверить не ту гипотезу.
+//
+// Детерминизм здесь по построению: зерна нет, потому что случайности нет.
+func (r *Run) loadClosed(ctx context.Context, method, url string, body []byte, clients int, dur, timeout time.Duration) loadStats {
+	client := &http.Client{Timeout: timeout, Transport: loadTransport()}
+
+	var (
+		mu    sync.Mutex
+		stats loadStats
+		wg    sync.WaitGroup
+	)
+	deadline := time.Now().Add(dur)
+
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				if ctx.Err() != nil {
+					return
+				}
+				start := time.Now()
+				code, err := doOnce(client, method, url, body)
+				took := time.Since(start)
+
+				mu.Lock()
+				stats.observe(code, err, took)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()

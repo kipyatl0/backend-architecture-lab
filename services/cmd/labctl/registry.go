@@ -146,6 +146,11 @@ type ScriptConfig struct {
 	PreOrders int     `json:"pre_orders"` // строк, появившихся до того, как за журналом начали следить
 	BulkAtS   float64 `json:"bulk_at_s"`
 	DeleteAtS float64 `json:"delete_at_s"`
+
+	// проверка гипотез: обещание, с которым сверяется нагрузочный тест (m12 l04)
+	SLOP99MS      int     `json:"slo_p99_ms"`     // обещанный потолок хвоста
+	SLOErrorPct   float64 `json:"slo_error_pct"`  // обещанная доля отказов
+	ClosedClients int     `json:"closed_clients"` // сколько клиентов ходит по кругу в закрытой модели
 }
 
 // Значения по умолчанию у ручек обмена — не «на всякий случай», а часть
