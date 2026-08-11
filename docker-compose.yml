@@ -10,14 +10,15 @@ name: backend-architecture-lab
 #   cdc     m07 l03       + debezium: события из журнала репликации
 #   cluster m08           kafka ×3 и реплика базы: кворум, ISR, отставание
 #   cache   m09           + redis: проекция, кэш, распределённая блокировка
+#   scale   m10           второй инстанс заказов и балансировщик перед ними
 #
 # Служба одна и та же во всех профилях — меняется только то, где живёт модуль
 # уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же): пусто —
 # модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью, которую
 # сцена умеет портить.
 #
-# Профили следующих модулей (cluster, cache, scale, trace, verify, trust)
-# добавляются сюда по мере роста курса и не ломают сцены предыдущих профилей.
+# Профили следующих модулей (trace, verify, trust) добавляются сюда по мере
+# роста курса и не ломают сцены предыдущих профилей.
 
 services:
 
@@ -25,7 +26,7 @@ services:
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono, split, net, broker, cdc, cluster, cache]
+    profiles: [mono, split, net, broker, cdc, cluster, cache, scale]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -241,15 +242,18 @@ services:
   # Заказы после выделения из монолита: своя база, свой исходящий ящик.
   # Базу и схему сервис создаёт себе сам — иначе сцена m07 требовала бы от
   # студента ./lab reset ровно один раз в жизни и молча ломалась без него.
-  orders:
+  orders: &orders-instance
     image: ${LAB_REGISTRY}/orders:${LAB_VERSION}
     build:
       context: ./services
       args:
         BIN: orders
-    profiles: [broker, cdc, cluster, cache]
-    environment:
+    profiles: [broker, cdc, cluster, cache, scale]
+    environment: &orders-env
       LAB_SERVICE: orders
+      # Как этот инстанс называет себя в ответе (заголовок X-Lab-Instance).
+      # До m10 инстанс был один, и вопрос «кто ответил» не стоял.
+      LAB_INSTANCE: orders-1
       LAB_ADDR: ":8050"
       # Пул пошире обычного: сцена про давку на промахе кэша подаёт сотню
       # одновременных читателей, и на пуле по умолчанию она показывала бы
@@ -283,6 +287,40 @@ services:
       retries: 30
       start_period: 3s
     mem_limit: 256m
+
+  # ── профиль scale: инстансов стало больше одного ────────────────────────
+  # Тот же сервис заказов, поднятый вторым экземпляром. Не «второй сервис»:
+  # образ, конфигурация и база у него те же самые — отличается только имя,
+  # которым он подписывает свои ответы. Ровно из этого «одинаковые, но у
+  # каждого своя память» и растут сцены m10.
+
+  orders-2:
+    <<: *orders-instance
+    profiles: [scale]
+    environment:
+      <<: *orders-env
+      LAB_INSTANCE: orders-2
+
+  # Балансировщик перед двумя инстансами. Один процесс, две точки входа:
+  # 8080 — решение на каждом запросе (L7), 8081 — решение на каждом соединении
+  # (L4). Конфигурация целиком лежит в config/nginx.conf.
+  balancer:
+    image: nginx:1.30.4-alpine
+    profiles: [scale]
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      orders:
+        condition: service_healthy
+      orders-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/_lab/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    mem_limit: 64m
 
   # Отправитель исходящего ящика. Отдельный процесс, а не горутина внутри
   # заказов: иначе «ящик пережил смерть процесса» показать было бы нечем.
@@ -479,6 +517,11 @@ services:
       LAB_TOXIPROXY_URL: http://toxiproxy:8474
       LAB_COURIER_URL: http://courier:8060
       LAB_ORDERS_URL: http://orders:8050
+      # Второй инстанс и балансировщик перед ними (m10). Сцена ходит и через
+      # балансировщик, и к инстансам напрямую: только так видно, кто ответил.
+      LAB_ORDERS2_URL: http://orders-2:8050
+      LAB_BALANCER_L7: http://balancer:8080
+      LAB_BALANCER_L4: http://balancer:8081
       LAB_RELAY_URL: http://outbox-relay:8040
       LAB_DEBEZIUM_URL: http://debezium:8083
       # К какой базе подключать коннектор захвата изменений: он ходит в неё

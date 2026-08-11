@@ -127,6 +127,17 @@ type ScriptConfig struct {
 	StallMS    int `json:"stall_ms"`     // сколько держатель аренды не подаёт признаков жизни
 	Burst      int `json:"burst"`        // сколько записей подаётся потоком
 
+	// масштабирование: инстансы, балансировка и шарды (m10)
+	Conns     int      `json:"conns"`          // сколько долгих соединений держит клиент
+	HeavyReqs int      `json:"heavy_requests"` // запросов по «горячему» соединению
+	LightReqs int      `json:"light_requests"` // запросов по каждому из остальных
+	CacheMode string   `json:"cache_mode"`     // shared — общая память, local — память инстанса
+	Shards    []int    `json:"shards"`         // на сколько шардов раскладывают в каждом прогоне
+	Stream    int      `json:"stream"`         // сколько заказов подаётся потоком
+	HotShare  float64  `json:"hot_share"`      // доля потока, приходящаяся на один ресторан
+	ShardMS   int      `json:"shard_ms"`       // во сколько шарду обходится одна запись
+	Catalog   []string `json:"catalog"`        // рестораны, по которым разложен поток
+
 	// журнал репликации базы
 	PreOrders int     `json:"pre_orders"` // строк, появившихся до того, как за журналом начали следить
 	BulkAtS   float64 `json:"bulk_at_s"`

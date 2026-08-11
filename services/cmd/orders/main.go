@@ -50,6 +50,9 @@ type config struct {
 	CacheTTLMS   int  `json:"cache_ttl_ms"`
 	CardMS       int  `json:"card_ms"`
 	SingleFlight bool `json:"single_flight"`
+	// Где лежит кэш (m10 l01): shared — общая быстрая память, видная всем
+	// инстансам; local — память этого процесса, своя у каждого инстанса.
+	CacheMode string `json:"cache_mode"`
 }
 
 func defaults() config {
@@ -57,6 +60,7 @@ func defaults() config {
 		WriteMode: "none", Target: "both", CrashAfterCommit: false,
 		Saga: false, FailStep: "", Compensate: true,
 		ReadFrom: "primary", CacheTTLMS: 2000, CardMS: 200, SingleFlight: false,
+		CacheMode: "shared",
 	}
 }
 
@@ -127,7 +131,9 @@ func main() {
 	mux.HandleFunc("POST /_lab/read-reset", a.handleReadReset)
 
 	addr := lab.Env("LAB_ADDR", ":8050")
-	if err := lab.Serve(addr, mux, log, nil); err != nil {
+	// Каждый ответ подписан именем инстанса: с m10 их больше одного, и вопрос
+	// «кто именно ответил» становится предметом урока.
+	if err := lab.Serve(addr, lab.WithInstance(mux), log, nil); err != nil {
 		log.Error("сервис остановлен с ошибкой", "err", err)
 	}
 }
@@ -266,6 +272,12 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		event.ID = fmt.Sprintf("evt_%d", id)
 		a.rec.Record("orders.committed", map[string]string{"order": strconv.FormatInt(id, 10)})
 	}
+
+	// Данные ресторана изменились, и инстанс, принявший запись, сбрасывает свою
+	// карточку. Свою — и только свою: до памяти соседнего процесса ему не
+	// дотянуться. С общим кэшем (m09) этой строки хватило бы на всех; с
+	// локальным (m10 l01) остальные инстансы продолжают отвечать старое.
+	a.read.localDrop("card:" + req.Restaurant)
 
 	// Транзакция зафиксирована. Данные есть. События ещё нет — и вот здесь
 	// процесс умирает: не «падает от ошибки», а просто исчезает.
@@ -519,6 +531,7 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		CacheTTLMS       *int    `json:"cache_ttl_ms"`
 		CardMS           *int    `json:"card_ms"`
 		SingleFlight     *bool   `json:"single_flight"`
+		CacheMode        *string `json:"cache_mode"`
 		Reset            bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -561,10 +574,14 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if req.SingleFlight != nil {
 		a.cfg.SingleFlight = *req.SingleFlight
 	}
+	if req.CacheMode != nil {
+		a.cfg.CacheMode = *req.CacheMode
+	}
 	cfg := a.cfg
 	a.mu.Unlock()
 
 	if req.Reset {
+		a.read.localClear()
 		if _, err := a.pool.Exec(r.Context(), `TRUNCATE orders, outbox RESTART IDENTITY`); err != nil {
 			lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return

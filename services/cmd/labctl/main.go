@@ -44,6 +44,9 @@ var drivers = map[string]func(context.Context, *Run) error{
 	"scene27": scene27,
 	"scene28": scene28,
 	"scene29": scene29,
+	"scene30": scene30,
+	"scene31": scene31,
+	"scene32": scene32,
 	"scene41": scene41,
 }
 

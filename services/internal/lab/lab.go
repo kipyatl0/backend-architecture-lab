@@ -146,6 +146,32 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// Instance — как этот процесс называет себя в ответе. До m10 инстанс службы был
+// один, и вопрос «кто именно ответил» не возникал вовсе; с появлением второго
+// он становится предметом урока.
+func Instance() string {
+	if v := os.Getenv("LAB_INSTANCE"); v != "" {
+		return v
+	}
+	if v := os.Getenv("LAB_SERVICE"); v != "" {
+		return v
+	}
+	host, _ := os.Hostname()
+	return host
+}
+
+// WithInstance подписывает каждый ответ именем инстанса. Заголовок, а не поле
+// тела: тело — это ответ службы, и он обязан быть одинаковым у всех инстансов.
+// Подмешивать имя процесса в ответ значило бы менять контракт службы ради
+// удобства наблюдения.
+func WithInstance(h http.Handler) http.Handler {
+	name := Instance()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Lab-Instance", name)
+		h.ServeHTTP(w, r)
+	})
+}
+
 // Health вешает раздельные /health и /ready: живость процесса и готовность
 // обслуживать запросы — разные вопросы, и курс на этом настаивает.
 func Health(mux *http.ServeMux, ready func() error) {

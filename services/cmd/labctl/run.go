@@ -28,9 +28,14 @@ type Run struct {
 	OrdersURL    string
 	CourierURL   string
 	RelayURL     string
-	DebeziumURL  string
-	AMQPURL      string
-	Brokers      []string
+	// Профиль scale: второй инстанс той же службы и две точки входа
+	// балансировщика — по запросам и по соединениям.
+	Orders2URL  string
+	BalancerL7  string
+	BalancerL4  string
+	DebeziumURL string
+	AMQPURL     string
+	Brokers     []string
 	// Профиль cluster: обе копии базы напрямую и управление узлами. Сцены m08
 	// спрашивают не приложение, а сами узлы — «что у тебя лежит» и «жив ли ты».
 	PrimaryDSN string
@@ -61,6 +66,9 @@ func newRun(scene Scene, script Script) *Run {
 		ToxiproxyURL: lab.Env("LAB_TOXIPROXY_URL", "http://toxiproxy:8474"),
 		OrdersURL:    lab.Env("LAB_ORDERS_URL", "http://orders:8050"),
 		CourierURL:   lab.Env("LAB_COURIER_URL", "http://courier:8060"),
+		Orders2URL:   lab.Env("LAB_ORDERS2_URL", "http://orders-2:8050"),
+		BalancerL7:   lab.Env("LAB_BALANCER_L7", "http://balancer:8080"),
+		BalancerL4:   lab.Env("LAB_BALANCER_L4", "http://balancer:8081"),
 		RelayURL:     lab.Env("LAB_RELAY_URL", "http://outbox-relay:8040"),
 		DebeziumURL:  lab.Env("LAB_DEBEZIUM_URL", "http://debezium:8083"),
 		AMQPURL:      lab.Env("LAB_AMQP_URL", "amqp://lab:lab@rabbitmq:5672/"),

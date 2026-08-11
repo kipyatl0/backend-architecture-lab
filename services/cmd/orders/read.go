@@ -29,10 +29,20 @@ type readSide struct {
 	replica  *pgxpool.Pool
 	cache    *lab.Redis
 	inflight map[string]*flight
+	// Кэш внутри процесса (m10 l01). Та же карточка ресторана, только лежит она
+	// не в общей быстрой памяти, а в памяти этого инстанса — и потому у каждого
+	// инстанса своя. Сбросить её снаружи нечем: ровно это и делает локальный
+	// кэш спрятанным состоянием, а инстансы — не взаимозаменяемыми.
+	local map[string]localEntry
 
 	dbQueries atomic.Int64
 	hits      atomic.Int64
 	misses    atomic.Int64
+}
+
+type localEntry struct {
+	value string
+	until time.Time
 }
 
 // flight — один поход в базу, который делят все, кто пришёл за тем же ключом.
@@ -44,7 +54,40 @@ type flight struct {
 }
 
 func newReadSide() *readSide {
-	return &readSide{inflight: map[string]*flight{}}
+	return &readSide{inflight: map[string]*flight{}, local: map[string]localEntry{}}
+}
+
+// ── локальный кэш инстанса ──────────────────────────────────────────────────
+
+func (rs *readSide) localGet(key string) (string, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	e, ok := rs.local[key]
+	if !ok || time.Now().After(e.until) {
+		return "", false
+	}
+	return e.value, true
+}
+
+func (rs *readSide) localSet(key, value string, ttl time.Duration) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.local[key] = localEntry{value: value, until: time.Now().Add(ttl)}
+}
+
+// localDrop сбрасывает ключ у ЭТОГО инстанса. Другие инстансы про запись не
+// узнают: дотянуться до чужой памяти процессу нечем, и это не недоделка стенда,
+// а свойство локального кэша.
+func (rs *readSide) localDrop(key string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	delete(rs.local, key)
+}
+
+func (rs *readSide) localClear() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.local = map[string]localEntry{}
 }
 
 // replicaPool подключается ко второй копии базы лениво: в профилях m01–m07
@@ -168,15 +211,34 @@ func (a *app) handleCard(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cfg := a.config()
 	rs := a.read
-
-	cache, err := rs.redis()
-	if err != nil {
-		lab.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
-	}
 	key := "card:" + name
 
-	if v, ok, err := cache.Get(key); err == nil && ok {
+	// Где лежит значение — переключатель сцены, а не свойство службы. Общая
+	// быстрая память (m09) видна всем инстансам сразу; память процесса (m10) —
+	// только ему одному, и в этом вся разница.
+	var (
+		get func() (string, bool)
+		put func(string)
+	)
+	if cfg.CacheMode == "local" {
+		get = func() (string, bool) { return rs.localGet(key) }
+		put = func(v string) { rs.localSet(key, v, time.Duration(cfg.CacheTTLMS)*time.Millisecond) }
+	} else {
+		cache, err := rs.redis()
+		if err != nil {
+			lab.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		get = func() (string, bool) {
+			v, ok, err := cache.Get(key)
+			return v, err == nil && ok
+		}
+		put = func(v string) {
+			_ = cache.SetPX(key, v, time.Duration(cfg.CacheTTLMS)*time.Millisecond)
+		}
+	}
+
+	if v, ok := get(); ok {
 		rs.hits.Add(1)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("X-Lab-Source", "cache")
@@ -190,11 +252,14 @@ func (a *app) handleCard(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return "", err
 		}
-		_ = cache.SetPX(key, v, time.Duration(cfg.CacheTTLMS)*time.Millisecond)
+		put(v)
 		return v, nil
 	}
 
-	var value string
+	var (
+		value string
+		err   error
+	)
 	if !cfg.SingleFlight {
 		// Без защиты каждый, кто пришёл на промах, идёт в базу сам. Именно
 		// это и называется давкой: чем популярнее ключ, тем больше их придёт.
@@ -253,6 +318,7 @@ func (a *app) handleReadReset(w http.ResponseWriter, r *http.Request) {
 	rs.hits.Store(0)
 	rs.misses.Store(0)
 	rs.resetReplica()
+	rs.localClear()
 	if c, err := rs.redis(); err == nil {
 		_ = c.FlushAll()
 	}

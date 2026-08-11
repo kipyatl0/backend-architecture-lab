@@ -18,7 +18,7 @@ STATE_DIR="$LAB_DIR/.lab"
 PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
-KNOWN_PROFILES="mono split net broker cdc cluster cache"
+KNOWN_PROFILES="mono split net broker cdc cluster cache scale"
 
 # Где живёт модуль уведомлений в каждом профиле. Служба одна и та же — меняется
 # только это, и ровно из этого вырастают сцены m03 l05 и весь m05.
@@ -193,6 +193,7 @@ lab — стенд курса «Архитектура бэкенда: расп�
   cdc     то же плюс чтение журнала репликации базы
   cluster брокер из трёх узлов и вторая копия базы: кворум, ISR, отставание
   cache   быстрая память рядом с базой: проекция, кэш, аренда блокировки
+  scale   два инстанса службы и балансировщик перед ними: L4 против L7
 TXT
 }
 

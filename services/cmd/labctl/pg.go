@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // pgConnect подключается к узлу, дожидаясь его: реплика после пересборки
@@ -26,6 +27,36 @@ func pgConnect(ctx context.Context, dsn string, wait time.Duration) (*pgx.Conn, 
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("узел базы не ответил за %s: %w", wait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// pgPool — пул соединений к узлу базы. Одного соединения хватало всем сценам до
+// m10: они разговаривали с базой по очереди. Шардам в сцене 32 нужно
+// одновременно — у каждого свой работник, — и одно соединение на всех означало
+// бы общий ресурс ровно там, где сцена показывает, что общего ресурса нет.
+func pgPool(ctx context.Context, dsn string, conns int, wait time.Duration) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = int32(conns)
+	deadline := time.Now().Add(wait)
+	for {
+		pool, perr := pgxpool.NewWithConfig(ctx, cfg)
+		if perr == nil {
+			if perr = pool.Ping(ctx); perr == nil {
+				return pool, nil
+			}
+			pool.Close()
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("узел базы не ответил за %s: %w", wait, perr)
 		}
 		select {
 		case <-ctx.Done():

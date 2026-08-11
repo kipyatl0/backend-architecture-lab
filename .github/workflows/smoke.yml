@@ -12,9 +12,9 @@ on:
 jobs:
   scenes:
     runs-on: ubuntu-latest
-    # Тридцать сцен семи профилей, и каждая поднимает свой: остановка и подъём
-    # узла брокера в сценах m08 стоят десятков секунд сами по себе.
-    timeout-minutes: 70
+    # Тридцать три сцены восьми профилей, и каждая поднимает свой: остановка и
+    # подъём узла брокера в сценах m08 стоят десятков секунд сами по себе.
+    timeout-minutes: 85
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +36,8 @@ jobs:
           ./lab logs kafka-1 || true
           ./lab logs postgres-replica || true
           ./lab logs redis || true
+          ./lab logs orders-2 || true
+          ./lab logs balancer || true
 
       - name: погасить стенд
         if: always()
