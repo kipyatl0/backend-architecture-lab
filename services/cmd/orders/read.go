@@ -38,6 +38,15 @@ type readSide struct {
 	dbQueries atomic.Int64
 	hits      atomic.Int64
 	misses    atomic.Int64
+
+	// Кто приходил за заказом (m13 l02). Считается всегда, а не только когда
+	// сервис проверяет право: «сколько запросов пришло мимо периметра» — вопрос
+	// к сервису, и ответ на него не должен зависеть от его настроек.
+	reads      atomic.Int64
+	noContext  atomic.Int64 // контекста пользователя нет вовсе: запрос пришёл не через периметр
+	forged     atomic.Int64 // контекст есть, подпись под ним не сошлась
+	viaGateway atomic.Int64 // контекст подтверждён подписью периметра
+	denied     atomic.Int64 // право проверено сервисом и не подтвердилось
 }
 
 type localEntry struct {
@@ -150,6 +159,35 @@ func (a *app) handleReadOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := a.config()
 
+	// Кто пришёл. Контекст пользователя ставит периметр и подписывает его своим
+	// ключом; выставить заголовок может кто угодно, кто дотянулся до сети, —
+	// подписать не может никто, кроме периметра.
+	user := r.Header.Get(lab.HeaderUser)
+	trusted := lab.CheckContext(user, r.Header.Get(lab.HeaderUserSig))
+	a.read.reads.Add(1)
+	switch {
+	case user == "":
+		a.read.noContext.Add(1)
+	case !trusted:
+		a.read.forged.Add(1)
+	default:
+		a.read.viaGateway.Add(1)
+	}
+
+	// Сервис проверяет право сам — или не проверяет вовсе. Второе и есть та
+	// самая мягкая начинка: «раз запрос дошёл, значит его уже проверили».
+	if cfg.Authz && !trusted {
+		a.read.denied.Add(1)
+		reason := "контекста пользователя нет"
+		if user != "" {
+			reason = "подпись контекста не сошлась"
+		}
+		lab.WriteJSON(w, http.StatusUnauthorized, map[string]any{
+			"order": id, "code": "no_context", "error": reason,
+		})
+		return
+	}
+
 	pool := a.pool
 	source := "primary"
 	if cfg.ReadFrom == "replica" {
@@ -173,6 +211,16 @@ func (a *app) handleReadOrder(w http.ResponseWriter, r *http.Request) {
 		// то наблюдение, ради которого сцена существует.
 		lab.WriteJSON(w, http.StatusNotFound, map[string]any{
 			"order": id, "found": false, "source": source,
+		})
+		return
+	}
+	// Владелец заказа известен только здесь: у периметра этих данных нет и быть
+	// не может. Поэтому решение «твой ли это заказ» принимается рядом с данными,
+	// а не на границе сети.
+	if cfg.Authz && client != user {
+		a.read.denied.Add(1)
+		lab.WriteJSON(w, http.StatusForbidden, map[string]any{
+			"order": id, "code": "not_yours", "error": "заказ не ваш",
 		})
 		return
 	}
@@ -304,9 +352,14 @@ func (rs *readSide) share(key string, fill func() (string, error)) (string, erro
 func (a *app) handleReadStats(w http.ResponseWriter, r *http.Request) {
 	rs := a.read
 	lab.WriteJSON(w, http.StatusOK, map[string]any{
-		"db_queries": rs.dbQueries.Load(),
-		"hits":       rs.hits.Load(),
-		"misses":     rs.misses.Load(),
+		"db_queries":  rs.dbQueries.Load(),
+		"hits":        rs.hits.Load(),
+		"misses":      rs.misses.Load(),
+		"reads":       rs.reads.Load(),
+		"no_context":  rs.noContext.Load(),
+		"forged":      rs.forged.Load(),
+		"via_gateway": rs.viaGateway.Load(),
+		"denied":      rs.denied.Load(),
 	})
 }
 
@@ -317,6 +370,11 @@ func (a *app) handleReadReset(w http.ResponseWriter, r *http.Request) {
 	rs.dbQueries.Store(0)
 	rs.hits.Store(0)
 	rs.misses.Store(0)
+	rs.reads.Store(0)
+	rs.noContext.Store(0)
+	rs.forged.Store(0)
+	rs.viaGateway.Store(0)
+	rs.denied.Store(0)
 	rs.resetReplica()
 	rs.localClear()
 	if c, err := rs.redis(); err == nil {

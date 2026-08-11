@@ -12,7 +12,7 @@ on:
 jobs:
   scenes:
     runs-on: ubuntu-latest
-    # Тридцать пять сцен девяти профилей, и каждая поднимает свой: остановка и
+    # Тридцать девять сцен десяти профилей, и каждая поднимает свой: остановка и
     # подъём узла брокера в сценах m08 стоят десятков секунд сами по себе.
     timeout-minutes: 95
     steps:
@@ -40,6 +40,7 @@ jobs:
           ./lab logs balancer || true
           ./lab logs notifier || true
           ./lab logs jaeger || true
+          ./lab logs gateway || true
 
       - name: погасить стенд
         if: always()

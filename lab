@@ -18,7 +18,7 @@ STATE_DIR="$LAB_DIR/.lab"
 PROJECT="backend-architecture-lab"   # см. `name:` в docker-compose.yml
 
 # Профили Compose, известные стенду. Пополняется вместе с курсом.
-KNOWN_PROFILES="mono split net broker cdc cluster cache scale trace"
+KNOWN_PROFILES="mono split net broker cdc cluster cache scale trace trust"
 
 # Где живёт модуль уведомлений в каждом профиле. Служба одна и та же — меняется
 # только это, и ровно из этого вырастают сцены m03 l05 и весь m05.
@@ -30,6 +30,7 @@ notifier_url() {
     broker) printf 'http://notifier:8070' ;;     # рядом с брокером: вызовом ИЛИ подпиской
     cdc)    printf 'http://notifier:8070' ;;
     trace)  printf 'http://notifier:8070' ;;
+    trust)  printf '' ;;                         # уведомлений в кадре m13 нет
     *)      printf '' ;;
   esac
 }
@@ -40,6 +41,7 @@ notifier_url() {
 otlp_url() {
   case "$1" in
     trace) printf 'http://jaeger:4318/v1/traces' ;;
+    trust) printf '' ;;                          # приёмника трейсов в m13 нет
     *)     printf '' ;;
   esac
 }
@@ -206,6 +208,7 @@ lab — стенд курса «Архитектура бэкенда: расп�
   cache   быстрая память рядом с базой: проекция, кэш, аренда блокировки
   scale   два инстанса службы и балансировщик перед ними: L4 против L7
   trace   сквозной контекст запроса и приёмник трейсов: интерфейс на 16686
+  trust   периметр перед службой: токены, проверка права, контекст пользователя
 TXT
 }
 

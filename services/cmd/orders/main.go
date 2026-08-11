@@ -58,6 +58,12 @@ type config struct {
 	// (m11 l01). По HTTP контекст едет сам; через брокер — только если
 	// отправитель положил его туда руками. Ровно на этом решении и рвётся трейс.
 	Propagate bool `json:"propagate"`
+
+	// Проверяет ли сервис право сам (m13 l02). Выключено — сервис считает, что
+	// раз запрос пришёл, значит его уже кто-то проверил; включено — читает
+	// контекст пользователя, проверяет подпись под ним и отдаёт заказ только
+	// его владельцу. Переключатель сцены, а не свойство сервиса.
+	Authz bool `json:"authz"`
 }
 
 func defaults() config {
@@ -65,7 +71,7 @@ func defaults() config {
 		WriteMode: "none", Target: "both", CrashAfterCommit: false,
 		Saga: false, FailStep: "", Compensate: true,
 		ReadFrom: "primary", CacheTTLMS: 2000, CardMS: 200, SingleFlight: false,
-		CacheMode: "shared", Propagate: false,
+		CacheMode: "shared", Propagate: false, Authz: false,
 	}
 }
 
@@ -581,6 +587,7 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		SingleFlight     *bool   `json:"single_flight"`
 		CacheMode        *string `json:"cache_mode"`
 		Propagate        *bool   `json:"propagate"`
+		Authz            *bool   `json:"authz"`
 		Reset            bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -628,6 +635,9 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Propagate != nil {
 		a.cfg.Propagate = *req.Propagate
+	}
+	if req.Authz != nil {
+		a.cfg.Authz = *req.Authz
 	}
 	cfg := a.cfg
 	a.mu.Unlock()

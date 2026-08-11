@@ -44,7 +44,10 @@ type Run struct {
 	// Профиль trace: приёмник трейсов. Сцена достаёт из него дерево тем же
 	// запросом, каким его достаёт интерфейс.
 	JaegerURL string
-	Docker    *lab.Docker
+	// Профиль trust: периметр. Сцена ходит и через него, и к сервису напрямую —
+	// разница между этими путями и есть предмет сцен m13.
+	GatewayURL string
+	Docker     *lab.Docker
 
 	// С кого собираются наблюдения. До m06 сцену наблюдал один монолит; с
 	// появлением второго и третьего сервиса источников становится несколько,
@@ -80,6 +83,7 @@ func newRun(scene Scene, script Script) *Run {
 		ReplicaDSN:   lab.Env("LAB_REPLICA_DSN", "postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable"),
 		RedisAddr:    lab.Env("LAB_REDIS_ADDR", "redis:6379"),
 		JaegerURL:    lab.Env("LAB_JAEGER_URL", "http://jaeger:16686"),
+		GatewayURL:   lab.Env("LAB_GATEWAY_URL", "http://gateway:8000"),
 		Docker:       lab.NewDocker(lab.Env("LAB_COMPOSE_PROJECT", "backend-architecture-lab")),
 		// Управляющий клиент — не участник сцены: его таймаут щедрый,
 		// иначе он сам стал бы источником отказа.

@@ -151,6 +151,15 @@ type ScriptConfig struct {
 	SLOP99MS      int     `json:"slo_p99_ms"`     // обещанный потолок хвоста
 	SLOErrorPct   float64 `json:"slo_error_pct"`  // обещанная доля отказов
 	ClosedClients int     `json:"closed_clients"` // сколько клиентов ходит по кругу в закрытой модели
+
+	// периметр и право доступа (m13)
+	Stranger     string  `json:"stranger"`      // второй клиент: тот, чей заказ не его
+	Neighbor     string  `json:"neighbor"`      // как зовут соседа по сети в timeline
+	Orders       int     `json:"orders_count"`  // сколько заказов заводит сцена
+	TokenTTLMS   int     `json:"token_ttl_ms"`  // срок жизни выданного токена
+	IntrospectMS int     `json:"introspect_ms"` // сколько эмитент думает над ответом
+	PollMS       int     `json:"poll_ms"`       // с каким шагом клиент опрашивает службу
+	RevokeAtS    float64 `json:"revoke_at_s"`   // на какой секунде прогона отзываются права
 }
 
 // Значения по умолчанию у ручек обмена — не «на всякий случай», а часть

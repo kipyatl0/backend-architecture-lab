@@ -12,14 +12,15 @@ name: backend-architecture-lab
 #   cache   m09           + redis: проекция, кэш, распределённая блокировка
 #   scale   m10           второй инстанс заказов и балансировщик перед ними
 #   trace   m11           + jaeger: сквозной контекст, трейсы, разрыв на брокере
+#   trust   m13           + gateway: периметр, токены, контекст пользователя
 #
 # Служба одна и та же во всех профилях — меняется только то, где живёт модуль
 # уведомлений. Адрес ему подставляет `lab` (см. notifier_url там же): пусто —
 # модуль внутри процесса, notifier — за сетью, toxiproxy — за сетью, которую
 # сцена умеет портить.
 #
-# Профили следующих модулей (verify, trust) добавляются сюда по мере роста
-# курса и не ломают сцены предыдущих профилей.
+# Профили следующих модулей добавляются сюда по мере роста курса и не ломают
+# сцены предыдущих профилей.
 
 services:
 
@@ -27,7 +28,7 @@ services:
 
   postgres:
     image: postgres:18.4-alpine
-    profiles: [mono, split, net, broker, cdc, cluster, cache, scale, trace]
+    profiles: [mono, split, net, broker, cdc, cluster, cache, scale, trace, trust]
     environment:
       POSTGRES_USER: delivery
       POSTGRES_PASSWORD: delivery
@@ -262,7 +263,7 @@ services:
       context: ./services
       args:
         BIN: orders
-    profiles: [broker, cdc, cluster, cache, scale, trace]
+    profiles: [broker, cdc, cluster, cache, scale, trace, trust]
     environment: &orders-env
       LAB_SERVICE: orders
       # Как этот инстанс называет себя в ответе (заголовок X-Lab-Instance).
@@ -287,6 +288,10 @@ services:
       # `lab` по имени профиля.
       LAB_KAFKA_BROKERS: ${LAB_KAFKA_BROKERS:-kafka:9092}
       LAB_OTLP_URL: ${LAB_OTLP_URL:-}
+      # Ключ, которым периметр подписывает контекст пользователя (m13 l02).
+      # Общий у шлюза и у сервиса: без него сервис не отличит «периметр сказал,
+      # чей это запрос» от «сосед по сети выставил заголовок сам».
+      LAB_CONTEXT_KEY: lab-context-key
     # Сцены m07 роняют этот сервис намеренно: предмет урока — что осталось в
     # базе и что не осталось в брокере, а не то, что стенд лежит.
     restart: unless-stopped
@@ -540,6 +545,41 @@ services:
       start_period: 5s
     mem_limit: 512m
 
+  # ── профиль trust: периметр перед службой ───────────────────────────────
+  # Единственный новый контейнер m13, и он в кадре: здесь предъявляют токен,
+  # здесь принимают решение о праве и отсюда вниз по цепочке едет контекст
+  # пользователя. Эмитент токенов живёт в этом же процессе отдельной ручкой:
+  # отдельный контейнер ради одной ручки объяснял бы студенту стенд вместо
+  # предмета, а участником он от этого быть не перестаёт — шлюз ходит к нему
+  # обычным запросом по сети.
+
+  gateway:
+    image: ${LAB_REGISTRY}/gateway:${LAB_VERSION}
+    build:
+      context: ./services
+      args:
+        BIN: gateway
+    profiles: [trust]
+    environment:
+      LAB_SERVICE: gateway
+      LAB_ADDR: ":8000"
+      LAB_ORDERS_URL: http://orders:8050
+      # Куда шлюз ходит за интроспекцией. Себе же: эмитент в этом контейнере.
+      LAB_ISSUER_URL: http://127.0.0.1:8000
+      LAB_TOKEN_KEY: lab-token-key
+      LAB_CONTEXT_KEY: lab-context-key
+      LAB_OTLP_URL: ${LAB_OTLP_URL:-}
+    depends_on:
+      orders:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    mem_limit: 128m
+
   # ── исполнитель сцен ────────────────────────────────────────────────────
   # Не сервис: поднимается на время одной сцены через `docker compose run`.
   # Живёт в своём профиле, чтобы `lab up <профиль>` его не запускал.
@@ -564,6 +604,9 @@ services:
       LAB_BALANCER_L7: http://balancer:8080
       LAB_BALANCER_L4: http://balancer:8081
       LAB_RELAY_URL: http://outbox-relay:8040
+      # Периметр (m13). Сцена ходит и через него, и к сервису напрямую: разница
+      # между этими двумя путями и есть предмет обеих сцен профиля.
+      LAB_GATEWAY_URL: http://gateway:8000
       LAB_DEBEZIUM_URL: http://debezium:8083
       # К какой базе подключать коннектор захвата изменений: он ходит в неё
       # сам, мимо сервиса, — этим приёмом приложение и не задействовано.
