@@ -40,7 +40,13 @@ type Run struct {
 	// спрашивают не приложение, а сами узлы — «что у тебя лежит» и «жив ли ты».
 	PrimaryDSN string
 	ReplicaDSN string
-	RedisAddr  string
+	// Сцена 40: место, куда переезжают профили клиентов. Базы у нового места
+	// заранее нет — её заводит оператор переезда, как и в жизни, поэтому
+	// сцене нужен и адрес самой базы, и адрес соседней, через которую её
+	// создают: к несуществующей базе не подключиться.
+	OldPlaceDSN string
+	NewPlaceDSN string
+	RedisAddr   string
 	// Профиль trace: приёмник трейсов. Сцена достаёт из него дерево тем же
 	// запросом, каким его достаёт интерфейс.
 	JaegerURL string
@@ -81,6 +87,8 @@ func newRun(scene Scene, script Script) *Run {
 		Brokers:      strings.Split(lab.Env("LAB_KAFKA_BROKERS", "kafka:9092"), ","),
 		PrimaryDSN:   lab.Env("LAB_PRIMARY_DSN", "postgres://delivery:delivery@postgres:5432/orders?sslmode=disable"),
 		ReplicaDSN:   lab.Env("LAB_REPLICA_DSN", "postgres://delivery:delivery@postgres-replica:5432/orders?sslmode=disable"),
+		OldPlaceDSN:  lab.Env("LAB_OLDPLACE_DSN", "postgres://delivery:delivery@postgres:5432/delivery?sslmode=disable"),
+		NewPlaceDSN:  lab.Env("LAB_NEWPLACE_DSN", "postgres://delivery:delivery@postgres:5432/clients?sslmode=disable"),
 		RedisAddr:    lab.Env("LAB_REDIS_ADDR", "redis:6379"),
 		JaegerURL:    lab.Env("LAB_JAEGER_URL", "http://jaeger:16686"),
 		GatewayURL:   lab.Env("LAB_GATEWAY_URL", "http://gateway:8000"),

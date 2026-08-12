@@ -153,13 +153,17 @@ type ScriptConfig struct {
 	ClosedClients int     `json:"closed_clients"` // сколько клиентов ходит по кругу в закрытой модели
 
 	// изменение системы: выкатка двух версий и переезд данных (m14)
-	Items      []Item `json:"items"`        // позиции заказа: новый вид запроса
-	Requests   int    `json:"requests"`     // сколько запросов подаётся в каждом прогоне
-	History    int    `json:"history"`      // сколько заказов лежит в старом месте до переезда
-	Batch      int    `json:"batch"`        // размер партии переливки
-	FlowFirst  int    `json:"flow_first"`   // поток заказов сразу после включения двойной записи
-	FlowSecond int    `json:"flow_second"`  // поток заказов между партиями
-	LostCopyAt int    `json:"lost_copy_at"` // у какого по счёту заказа потока копия не доедет
+	Items         []Item   `json:"items"`           // позиции заказа: новый вид запроса
+	Requests      int      `json:"requests"`        // сколько запросов подаётся в каждом прогоне
+	History       int      `json:"history"`         // сколько профилей лежит в старом месте до переезда
+	Batch         int      `json:"batch"`           // размер партии переливки
+	FlowFirst     int      `json:"flow_first"`      // поток регистраций сразу после включения двойной записи
+	FlowSecond    int      `json:"flow_second"`     // поток регистраций между партиями
+	LostCopyAt    int      `json:"lost_copy_at"`    // у какой по счёту регистрации потока копия не доедет
+	FirstClientID int64    `json:"first_client_id"` // с какого номера старое место нумерует профили
+	Names         []string `json:"names"`           // кольцо имён: кем регистрируются клиенты
+	Streets       []string `json:"streets"`         // кольцо улиц: из них складывается адрес профиля
+	FixedAddress  string   `json:"fixed_address"`   // адрес, который поддержка ставит вместо прежнего
 
 	// периметр и право доступа (m13)
 	Stranger     string  `json:"stranger"`      // второй клиент: тот, чей заказ не его

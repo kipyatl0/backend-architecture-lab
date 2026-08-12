@@ -151,8 +151,6 @@ func main() {
 	mux.HandleFunc("POST /_lab/emit", a.handleEmit)
 	mux.HandleFunc("POST /_lab/bulk-cancel", a.handleBulkCancel)
 	mux.HandleFunc("POST /_lab/erase", a.handleErase)
-	mux.HandleFunc("POST /_lab/mirror", a.handleMirror)
-	mux.HandleFunc("POST /_lab/drop-copy", a.handleDropCopy)
 	mux.HandleFunc("POST /_lab/cdc-reset", a.handleCDCReset)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
 	mux.HandleFunc("GET /orders/{id}", a.handleReadOrder)
@@ -781,74 +779,8 @@ func (a *app) handleBulkCancel(w http.ResponseWriter, r *http.Request) {
 	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": n})
 }
 
-// ── новое место на время переезда (m14 l02) ─────────────────────────────────
-//
-// Пока данные переезжают, у одной записи два места жительства. Копию сюда
-// присылает старый владелец — и только он: номер заказа принадлежит старому
-// месту, и если новое место начнёт нумеровать само, две копии одной записи
-// разъедутся по идентификаторам, а сверять их станет нечем.
-//
-// Ручка одна на оба источника копий — и на двойную запись, и на переливку
-// партиями: разница между ними не в том, как записать, а в том, кто и когда
-// шлёт. Запись идёт вставкой с обновлением: партия может встретить строку,
-// которую двойная запись уже принесла, и падать на этом нельзя.
-
-func (a *app) handleMirror(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID         int64  `json:"id"`
-		Client     string `json:"client"`
-		Restaurant string `json:"restaurant"`
-		Amount     int64  `json:"amount"`
-		Status     string `json:"status"`
-	}
-	if err := lab.ReadJSON(r, &req); err != nil {
-		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if req.ID <= 0 {
-		lab.WriteJSON(w, http.StatusBadRequest,
-			map[string]string{"error": "копия без номера заказа: нумерует старое место"})
-		return
-	}
-	if _, err := a.pool.Exec(r.Context(), `
-		INSERT INTO orders (id, client, restaurant, amount, status) VALUES ($1,$2,$3,$4,$5)
-		ON CONFLICT (id) DO UPDATE
-		   SET client = EXCLUDED.client, restaurant = EXCLUDED.restaurant,
-		       amount = EXCLUDED.amount, status = EXCLUDED.status`,
-		req.ID, req.Client, req.Restaurant, req.Amount, req.Status); err != nil {
-		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	// Номера пришли снаружи, и собственный счётчик о них не знает. После
-	// переноса владения нумеровать начнёт этот сервис — с того места, до
-	// которого дошло старое, а не с начала.
-	if _, err := a.pool.Exec(r.Context(),
-		`SELECT setval('orders_id_seq', GREATEST((SELECT max(id) FROM orders), 1))`); err != nil {
-		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	lab.WriteJSON(w, http.StatusOK, map[string]any{"order": req.ID})
-}
-
-// handleDropCopy убирает из нового места строку, которой в старом уже нет.
-// Это и есть разрешение расхождения третьего вида: правило «истина в старом
-// месте» действует в обе стороны, а не только на недостачу.
-func (a *app) handleDropCopy(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Order int64 `json:"order"`
-	}
-	if err := lab.ReadJSON(r, &req); err != nil {
-		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	tag, err := a.pool.Exec(r.Context(), `DELETE FROM orders WHERE id=$1`, req.Order)
-	if err != nil {
-		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": tag.RowsAffected()})
-}
-
+// handleErase — удаление строки по просьбе клиента. В журнале репликации
+// (m07 l03) у него свой вид события, и сцена показывает именно его.
 func (a *app) handleErase(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Order int64 `json:"order"`

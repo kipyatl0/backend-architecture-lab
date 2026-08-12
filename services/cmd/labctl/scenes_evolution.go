@@ -6,9 +6,9 @@ package main
 //
 //	39 · scale  — инстансов больше одного, значит на время выката за одним
 //	              адресом стоят обе версии сразу;
-//	40 · broker — единственный профиль, где рядом стоят старое место (монолит)
-//	              и новое (сервис заказов), а переезд возможен только между
-//	              двумя местами.
+//	40 · broker — переезжает остаток монолита, а остаток есть только там, где
+//	              заказы, курьеры и уведомления уже уехали в свои службы. Ни
+//	              брокер, ни служба заказов в сцене не участвуют.
 
 import (
 	"context"
@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ── сцена 39 — две версии одновременно (m14 l01) ────────────────────────────
@@ -284,14 +286,19 @@ func (r *Run) configureInstance(url string, body map[string]any) error {
 
 // ── сцена 40 — переезд данных со сверкой (m14 l02) ──────────────────────────
 //
-// Данные переезжают из старого места в новое, пока система работает. Отсюда
-// три обязательных части: двойная запись (новое не отстаёт от старого),
-// переливка партиями (старое доезжает до нового) и сверка — единственное, чем
-// доказывается, что копия равна истине.
+// Переезжает то, что монолит не отдал никому: профили клиентов. Заказы,
+// курьеров и уведомления к этому времени обслуживают выделенные службы, а
+// клиент со своим адресом так и остался в старом месте — и остаток этот виден
+// только там, где остальное уже уехало.
 //
-// Расхождения сцена заводит намеренно и по одному на механизм: копия не доехала,
-// строка изменилась после переливки, строка удалена после переливки. Все три
-// настоящие, все три не видны ни в одном месте по отдельности.
+// Данные переезжают, пока система работает. Отсюда три обязательных части:
+// двойная запись (новое не отстаёт от старого), переливка партиями (старое
+// доезжает до нового) и сверка — единственное, чем доказывается, что копия
+// равна истине.
+//
+// Расхождения сцена заводит намеренно и по одному на механизм: копия не
+// доехала, строка изменилась после переливки, строка удалена после переливки.
+// Все три настоящие, все три не видны ни в одном месте по отдельности.
 func scene40(ctx context.Context, r *Run) error {
 	cfg := r.Script.Config
 	r.Sources = nil
@@ -317,57 +324,72 @@ func scene40(ctx context.Context, r *Run) error {
 		lostAt = 3
 	}
 	if lostAt > flowA {
-		return fmt.Errorf("потерянная копия назначена на заказ %d, а в потоке их %d", lostAt, flowA)
+		return fmt.Errorf("потерянная копия назначена на регистрацию %d, а в потоке их %d", lostAt, flowA)
 	}
-	first := cfg.FirstOrderID
+	first := cfg.FirstClientID
 	if first == 0 {
-		first = 7714
+		first = 4021
+	}
+	if len(cfg.Names) == 0 || len(cfg.Streets) == 0 {
+		return fmt.Errorf("в сценарии не заданы имена и улицы: профиль клиента должен из чего-то состоять")
 	}
 
-	// Эквайринг и уведомления — фон этой сцены: заказы должны просто приниматься.
-	if err := r.postJSON(r.AcquirerURL+"/_lab/config", map[string]any{
-		"delay_ms": 0, "mode": "ok", "idempotent": false, "reset": true,
-	}, nil); err != nil {
-		return err
-	}
-	if err := r.configureNotifier(map[string]any{"mode": "ok", "strict": false, "reset": true}); err != nil {
-		return fmt.Errorf("уведомления не настроены — поднят ли профиль broker? %w", err)
-	}
+	// Старое место — монолит. Профили в нём заводит регистрация, и на неё же
+	// навешана двойная запись.
 	if err := r.configure(map[string]any{"reset": true}); err != nil {
 		return fmt.Errorf("старое место не настроено — поднят ли профиль broker? %w", err)
 	}
 	if err := r.postJSON(r.MonolithURL+"/_lab/prepare",
-		map[string]any{"first_order_id": first}, nil); err != nil {
+		map[string]any{"first_client_id": first}, nil); err != nil {
 		return err
 	}
-	// Новое место начинается пустым: переезд, который начался с непустого
-	// нового места, сверять нечем.
-	if err := r.configureOrders(map[string]any{
-		"reset": true, "write_mode": "none", "version": "v1",
-	}); err != nil {
-		return fmt.Errorf("новое место не настроено: %w", err)
+	// Новое место заводит оператор переезда: базы у него до этой секунды нет
+	// вовсе. Так это и происходит в жизни — хранилище нового владельца
+	// появляется раньше, чем его код.
+	newPlace, err := r.openNewPlace(ctx)
+	if err != nil {
+		return err
 	}
+	defer newPlace.Close(ctx)
 
 	client := &http.Client{Timeout: 60 * time.Second}
+	// seq — сколько регистраций сцена уже подала. Из него собираются поля
+	// профиля: имя, телефон и адрес обязаны быть предсказуемы, иначе сверка
+	// сравнивала бы случайные строки.
+	seq := 0
+	register := func(n int) error {
+		for i := 0; i < n; i++ {
+			body, _ := json.Marshal(profileOf(cfg, first+int64(seq), seq))
+			code, err := doOnce(client, http.MethodPost, r.MonolithURL+"/clients", body)
+			if err != nil {
+				return fmt.Errorf("профиль не принят старым местом: %w", err)
+			}
+			if code != http.StatusCreated {
+				return fmt.Errorf("профиль не принят старым местом: код %d", code)
+			}
+			seq++
+		}
+		return nil
+	}
 	step := func(key string) error {
-		old, err := r.placeCount(r.MonolithURL)
+		old, err := r.oldPlaceRows()
 		if err != nil {
 			return err
 		}
-		fresh, err := r.placeCount(r.OrdersURL)
+		fresh, err := newPlaceRows(ctx, newPlace)
 		if err != nil {
 			return err
 		}
-		r.Measure(key, "old", float64(old))
-		r.Measure(key, "new", float64(fresh))
-		r.Set(key+"_old", strconv.Itoa(old))
-		r.Set(key+"_new", strconv.Itoa(fresh))
-		r.Set(key+"_gap", strconv.Itoa(old-fresh))
+		r.Measure(key, "old", float64(len(old)))
+		r.Measure(key, "new", float64(len(fresh)))
+		r.Set(key+"_old", strconv.Itoa(len(old)))
+		r.Set(key+"_new", strconv.Itoa(len(fresh)))
+		r.Set(key+"_gap", strconv.Itoa(len(old)-len(fresh)))
 		return nil
 	}
 
 	// ── 1. история: то, что накопилось до переезда ──────────────────────────
-	if err := r.placeOrders(client, cfg, history); err != nil {
+	if err := register(history); err != nil {
 		return err
 	}
 	if err := step("history"); err != nil {
@@ -380,13 +402,13 @@ func scene40(ctx context.Context, r *Run) error {
 	}
 	for i := 1; i <= flowA; i++ {
 		if i == lostAt {
-			// Копия этого заказа не доедет. Приём заказа от этого не изменится
-			// ничем: вторая запись живёт вне транзакции первой.
+			// Копия этой регистрации не доедет. Приём профиля от этого не
+			// изменится ничем: вторая запись живёт вне транзакции первой.
 			if err := r.configure(map[string]any{"mirror_drop_next": 1}); err != nil {
 				return err
 			}
 		}
-		if err := r.placeOrders(client, cfg, 1); err != nil {
+		if err := register(1); err != nil {
 			return err
 		}
 	}
@@ -404,35 +426,40 @@ func scene40(ctx context.Context, r *Run) error {
 		}
 		batches = append(batches, ids)
 	}
+	if len(batches) < 3 {
+		return fmt.Errorf("партий переливки должно быть хотя бы три, вышло %d", len(batches))
+	}
 
-	if err := r.copyBatch(batches[0]); err != nil {
+	if err := r.copyBatch(ctx, newPlace, batches[0]); err != nil {
 		return err
 	}
 	if err := step("batch.1"); err != nil {
 		return err
 	}
 
-	// Дежурный отменяет заказ в старом месте. Двойная запись этого не видит:
-	// она навешана на приём заказа, а тут заказ никто не принимает.
+	// Поддержка исправляет адрес по звонку клиента. Двойная запись этого не
+	// видит: она навешана на регистрацию, а тут никто не регистрируется.
 	changed := first + 2
-	if err := r.postJSON(r.MonolithURL+"/_lab/cancel", map[string]any{"order": changed}, nil); err != nil {
+	address := cfg.FixedAddress
+	if address == "" {
+		address = "Садовая 12"
+	}
+	if err := r.postJSON(r.MonolithURL+"/_lab/edit-address",
+		map[string]any{"client": changed, "address": address}, nil); err != nil {
 		return err
 	}
 	if err := step("changed"); err != nil {
 		return err
 	}
 
-	if err := r.placeOrders(client, cfg, flowB); err != nil {
+	if err := register(flowB); err != nil {
 		return err
 	}
 	if err := step("flow.b"); err != nil {
 		return err
 	}
 
-	if len(batches) < 3 {
-		return fmt.Errorf("партий переливки должно быть хотя бы три, вышло %d", len(batches))
-	}
-	if err := r.copyBatch(batches[1]); err != nil {
+	if err := r.copyBatch(ctx, newPlace, batches[1]); err != nil {
 		return err
 	}
 	if err := step("batch.2"); err != nil {
@@ -442,7 +469,7 @@ func scene40(ctx context.Context, r *Run) error {
 	// Клиент просит удалить свои данные. Строка исчезает из старого места —
 	// и остаётся в новом, куда партия успела её перелить.
 	erased := batches[1][0]
-	if err := r.postJSON(r.MonolithURL+"/_lab/erase", map[string]any{"order": erased}, nil); err != nil {
+	if err := r.postJSON(r.MonolithURL+"/_lab/erase", map[string]any{"client": erased}, nil); err != nil {
 		return err
 	}
 	if err := step("erased"); err != nil {
@@ -450,7 +477,7 @@ func scene40(ctx context.Context, r *Run) error {
 	}
 
 	for _, ids := range batches[2:] {
-		if err := r.copyBatch(ids); err != nil {
+		if err := r.copyBatch(ctx, newPlace, ids); err != nil {
 			return err
 		}
 	}
@@ -459,7 +486,7 @@ func scene40(ctx context.Context, r *Run) error {
 	}
 
 	// ── 4. сверка ───────────────────────────────────────────────────────────
-	d, same, err := r.reconcile()
+	d, same, err := r.reconcile(ctx, newPlace)
 	if err != nil {
 		return err
 	}
@@ -483,38 +510,38 @@ func scene40(ctx context.Context, r *Run) error {
 	// Расхождение по полям печатается тем, что в нём разошлось: «одна запись
 	// отличается» — не наблюдение, а пересказ.
 	if len(d.mismatch) > 0 {
-		oldRows, err := r.storeMap(r.MonolithURL)
+		oldRows, err := r.oldPlaceMap()
 		if err != nil {
 			return err
 		}
-		newRows, err := r.storeMap(r.OrdersURL)
+		newRows, err := newPlaceMap(ctx, newPlace)
 		if err != nil {
 			return err
 		}
 		id := d.mismatch[0]
-		r.Set("mismatch_old", oldRows[id].Status)
-		r.Set("mismatch_new", newRows[id].Status)
+		r.Set("mismatch_old", oldRows[id].Address)
+		r.Set("mismatch_new", newRows[id].Address)
 	}
 
 	// ── 5. разрешение по заранее выбранному правилу ─────────────────────────
 	// Правило выбирается до переезда, а не в момент, когда сверка что-то нашла:
 	// пока владение не передано, истина — в старом месте.
-	current, err := r.storeMap(r.MonolithURL)
+	current, err := r.oldPlaceMap()
 	if err != nil {
 		return err
 	}
 	for _, id := range append(append([]int64{}, d.onlyOld...), d.mismatch...) {
-		if err := r.copyOne(current[id]); err != nil {
+		if err := copyOne(ctx, newPlace, current[id]); err != nil {
 			return err
 		}
 	}
 	for _, id := range d.onlyNew {
-		if err := r.postJSON(r.OrdersURL+"/_lab/drop-copy", map[string]any{"order": id}, nil); err != nil {
+		if err := dropCopy(ctx, newPlace, id); err != nil {
 			return err
 		}
 	}
 
-	after, sameAfter, err := r.reconcile()
+	after, sameAfter, err := r.reconcile(ctx, newPlace)
 	if err != nil {
 		return err
 	}
@@ -525,25 +552,28 @@ func scene40(ctx context.Context, r *Run) error {
 	r.Set("after_left", strconv.Itoa(left))
 
 	// ── 6. перенос владения ─────────────────────────────────────────────────
-	// Момент, ради которого всё и делалось: с этой секунды заказ заводит новое
-	// место, и старое о нём не узнаёт.
+	// Момент, ради которого всё и делалось: с этой секунды профиль заводит
+	// новое место, и старое о нём не узнаёт. Пишет его оператор — службы у
+	// нового места ещё нет, и её роль он играет так же, как во всех сценах
+	// курса роль клиента играет сама сцена.
 	if err := r.configure(map[string]any{"mirror": false}); err != nil {
 		return err
 	}
-	ids, err := r.createOrders(1, cfg.Client, cfg.Restaurant, cfg.Amount)
-	if err != nil {
+	owned := first + int64(seq)
+	if err := copyOne(ctx, newPlace, profileOf(cfg, owned, seq)); err != nil {
 		return err
 	}
 	if err := step("owned"); err != nil {
 		return err
 	}
-	r.Set("owned_order", strconv.FormatInt(ids[0], 10))
+	r.Set("owned_client", strconv.FormatInt(owned, 10))
 	r.Set("history", strconv.Itoa(history))
 	r.Set("batch", strconv.Itoa(batch))
 	r.Set("batches", strconv.Itoa(len(batches)))
 	r.Set("flow_a", strconv.Itoa(flowA))
 	r.Set("flow_b", strconv.Itoa(flowB))
 	r.Set("first", strconv.FormatInt(first, 10))
+	r.Set("address", address)
 	r.Set("batch1_from", strconv.FormatInt(batches[0][0], 10))
 	r.Set("batch1_to", strconv.FormatInt(batches[0][len(batches[0])-1], 10))
 	r.Set("batch2_from", strconv.FormatInt(batches[1][0], 10))
@@ -553,88 +583,159 @@ func scene40(ctx context.Context, r *Run) error {
 	return nil
 }
 
-// storeRow — запись так, как её отдаёт хозяин места. Сверка сравнивает их
+// clientRow — профиль так, как его отдаёт хозяин места. Сверка сравнивает их
 // целиком: расхождение по одному полю — такое же расхождение, как отсутствие
 // строки, и ловится оно только сравнением всех полей сразу.
-type storeRow struct {
-	ID         int64  `json:"id"`
-	Client     string `json:"client"`
-	Restaurant string `json:"restaurant"`
-	Amount     int64  `json:"amount"`
-	Status     string `json:"status"`
+type clientRow struct {
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Phone   string `json:"phone"`
+	Address string `json:"address"`
 }
 
-// ordersInStore спрашивает у самого хозяина места, что у него лежит. В чужую
-// базу сверка не заглядывает: у обоих мест есть свой ответ на этот вопрос, и
-// брать его надо у них.
-func (r *Run) ordersInStore(base string) ([]storeRow, error) {
-	var state struct {
-		Orders []storeRow `json:"orders"`
+// profileOf — профиль n-го по счёту клиента. Поля выводятся из номера, и это
+// не украшение: сверке нужно больше одного поля, иначе расхождение «строки
+// есть в обоих местах, а внутри разное» негде показать.
+func profileOf(cfg ScriptConfig, id int64, seq int) clientRow {
+	return clientRow{
+		ID:      id,
+		Name:    cfg.Names[seq%len(cfg.Names)],
+		Phone:   fmt.Sprintf("+7 900 555-%04d", id),
+		Address: fmt.Sprintf("%s %d", cfg.Streets[seq%len(cfg.Streets)], seq%9+1),
 	}
-	if err := r.getJSON(base+"/_lab/state", &state); err != nil {
+}
+
+// oldPlaceRows спрашивает у самого хозяина места, что у него лежит. В чужую
+// базу сверка не заглядывает: у старого места есть свой ответ на этот вопрос,
+// и брать его надо у него.
+func (r *Run) oldPlaceRows() ([]clientRow, error) {
+	var state struct {
+		Clients []clientRow `json:"clients"`
+	}
+	if err := r.getJSON(r.MonolithURL+"/_lab/state", &state); err != nil {
 		return nil, err
 	}
-	return state.Orders, nil
+	return state.Clients, nil
 }
 
-func (r *Run) storeMap(base string) (map[int64]storeRow, error) {
-	rows, err := r.ordersInStore(base)
+func (r *Run) oldPlaceMap() (map[int64]clientRow, error) {
+	rows, err := r.oldPlaceRows()
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[int64]storeRow, len(rows))
-	for _, o := range rows {
-		out[o.ID] = o
+	return rowsByID(rows), nil
+}
+
+// openNewPlace заводит новое место. База, в которую переезжают, до переезда не
+// существует: её создаёт оператор, подключившись к соседней. Таблица пустая —
+// переезд, начавшийся с непустого нового места, сверять нечем.
+func (r *Run) openNewPlace(ctx context.Context) (*pgx.Conn, error) {
+	admin, err := pgConnect(ctx, r.OldPlaceDSN, 60*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("сервер базы не ответил — поднят ли профиль broker? %w", err)
 	}
-	return out, nil
-}
-
-func (r *Run) placeCount(base string) (int, error) {
-	rows, err := r.ordersInStore(base)
-	return len(rows), err
-}
-
-// placeOrders — n заказов через старое место. Клиент здесь сама сцена, и
-// заказы настоящие: переезд идёт под потоком, а не на замершей системе.
-func (r *Run) placeOrders(c *http.Client, cfg ScriptConfig, n int) error {
-	body, _ := json.Marshal(map[string]any{
-		"client": cfg.Client, "restaurant": cfg.Restaurant, "amount": cfg.Amount,
-	})
-	for i := 0; i < n; i++ {
-		code, err := doOnce(c, http.MethodPost, r.MonolithURL+"/orders", body)
-		if err != nil {
-			return fmt.Errorf("заказ не принят старым местом: %w", err)
-		}
-		if code != http.StatusCreated {
-			return fmt.Errorf("заказ не принят старым местом: код %d", code)
+	var exists bool
+	if err := admin.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'clients')`).Scan(&exists); err != nil {
+		admin.Close(ctx)
+		return nil, err
+	}
+	if !exists {
+		if _, err := admin.Exec(ctx, `CREATE DATABASE clients`); err != nil {
+			admin.Close(ctx)
+			return nil, fmt.Errorf("новое место не создано: %w", err)
 		}
 	}
-	return nil
+	admin.Close(ctx)
+
+	conn, err := pgConnect(ctx, r.NewPlaceDSN, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS clients (
+			id      bigint PRIMARY KEY,
+			name    text NOT NULL,
+			phone   text NOT NULL,
+			address text NOT NULL
+		)`); err != nil {
+		conn.Close(ctx)
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `TRUNCATE clients`); err != nil {
+		conn.Close(ctx)
+		return nil, err
+	}
+	return conn, nil
 }
 
-// copyOne — одна строка в новое место. Той же ручкой, которой пользуется
-// двойная запись: разница между переливкой и потоком не в способе записи.
-func (r *Run) copyOne(row storeRow) error {
-	return r.postJSON(r.OrdersURL+"/_lab/mirror", map[string]any{
-		"id": row.ID, "client": row.Client, "restaurant": row.Restaurant,
-		"amount": row.Amount, "status": row.Status,
-	}, nil)
+func newPlaceRows(ctx context.Context, conn *pgx.Conn) ([]clientRow, error) {
+	rows, err := conn.Query(ctx, `SELECT id, name, phone, address FROM clients ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []clientRow{}
+	for rows.Next() {
+		var c clientRow
+		if err := rows.Scan(&c.ID, &c.Name, &c.Phone, &c.Address); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func newPlaceMap(ctx context.Context, conn *pgx.Conn) (map[int64]clientRow, error) {
+	rows, err := newPlaceRows(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	return rowsByID(rows), nil
+}
+
+func rowsByID(rows []clientRow) map[int64]clientRow {
+	out := make(map[int64]clientRow, len(rows))
+	for _, c := range rows {
+		out[c.ID] = c
+	}
+	return out
+}
+
+// copyOne — одна строка в новое место. Тем же способом, каким пишет двойная
+// запись: разница между переливкой и потоком не в способе записи, а в том, кто
+// и когда шлёт. Вставка с обновлением — партия может встретить строку, которую
+// двойная запись уже принесла, и падать на этом нельзя.
+func copyOne(ctx context.Context, conn *pgx.Conn, row clientRow) error {
+	_, err := conn.Exec(ctx,
+		`INSERT INTO clients (id, name, phone, address) VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (id) DO UPDATE SET name=$2, phone=$3, address=$4`,
+		row.ID, row.Name, row.Phone, row.Address)
+	return err
+}
+
+// dropCopy убирает из нового места строку, которой в старом уже нет. Это и есть
+// разрешение расхождения третьего вида: правило «истина в старом месте»
+// действует в обе стороны, а не только на недостачу.
+func dropCopy(ctx context.Context, conn *pgx.Conn, id int64) error {
+	_, err := conn.Exec(ctx, `DELETE FROM clients WHERE id=$1`, id)
+	return err
 }
 
 // copyBatch — одна партия переливки. Старое место читается в момент запуска
 // партии, а не по снимку, снятому в начале переезда: между партиями система
 // работает, и данные в старом месте меняются.
-func (r *Run) copyBatch(ids []int64) error {
-	src, err := r.storeMap(r.MonolithURL)
+func (r *Run) copyBatch(ctx context.Context, conn *pgx.Conn, ids []int64) error {
+	src, err := r.oldPlaceMap()
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
 		row, ok := src[id]
 		if !ok {
-			return fmt.Errorf("партия ссылается на заказ %d, которого в старом месте нет", id)
+			return fmt.Errorf("партия ссылается на профиль %d, которого в старом месте нет", id)
 		}
-		if err := r.copyOne(row); err != nil {
+		if err := copyOne(ctx, conn, row); err != nil {
 			return err
 		}
 	}
@@ -653,13 +754,13 @@ type migDiff struct {
 // reconcile сравнивает два места построчно. Сравнение по количеству строк —
 // не сверка: количество может сойтись при трёх расхождениях сразу, и в этой
 // сцене именно так и выходит.
-func (r *Run) reconcile() (migDiff, int, error) {
+func (r *Run) reconcile(ctx context.Context, conn *pgx.Conn) (migDiff, int, error) {
 	var d migDiff
-	old, err := r.storeMap(r.MonolithURL)
+	old, err := r.oldPlaceMap()
 	if err != nil {
 		return d, 0, err
 	}
-	fresh, err := r.storeMap(r.OrdersURL)
+	fresh, err := newPlaceMap(ctx, conn)
 	if err != nil {
 		return d, 0, err
 	}
@@ -707,4 +808,26 @@ func idList(ids []int64) string {
 		out += strconv.FormatInt(id, 10)
 	}
 	return out
+}
+
+// storeRow — заказ так, как его отдаёт служба. Сцене 39 он нужен, чтобы
+// спросить у самой службы, что у неё лежит после выката обеих версий.
+type storeRow struct {
+	ID         int64  `json:"id"`
+	Client     string `json:"client"`
+	Restaurant string `json:"restaurant"`
+	Amount     int64  `json:"amount"`
+	Status     string `json:"status"`
+}
+
+// ordersInStore спрашивает у самой службы, что у неё лежит: в её базу сцена
+// не заглядывает — ответ на этот вопрос есть у хозяина.
+func (r *Run) ordersInStore(base string) ([]storeRow, error) {
+	var state struct {
+		Orders []storeRow `json:"orders"`
+	}
+	if err := r.getJSON(base+"/_lab/state", &state); err != nil {
+		return nil, err
+	}
+	return state.Orders, nil
 }

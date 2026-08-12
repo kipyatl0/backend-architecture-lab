@@ -216,6 +216,15 @@ func cmdState() error {
 			Order int64  `json:"order"`
 			Text  string `json:"text"`
 		} `json:"notifications"`
+		// Профили клиентов — то, что монолит не отдал никому; в сцене 40 они
+		// переезжают. Здесь видно только старое место: новое принадлежит
+		// будущей службе клиентов, и спрашивать о нём монолита нечего.
+		Clients []struct {
+			ID      int64  `json:"id"`
+			Name    string `json:"name"`
+			Phone   string `json:"phone"`
+			Address string `json:"address"`
+		} `json:"clients"`
 		Totals struct {
 			Orders       int   `json:"orders"`
 			Charged      int   `json:"charged"`
@@ -242,9 +251,19 @@ func cmdState() error {
 	for _, n := range state.Notifications {
 		fmt.Printf("  %d  %s\n", n.Order, n.Text)
 	}
-	fmt.Printf("\nИтого: заказов %d, списаний %d на %d\n",
+	if len(state.Clients) > 0 {
+		fmt.Printf("Профили клиентов в старом месте (%d)\n", len(state.Clients))
+		for _, c := range state.Clients {
+			fmt.Printf("  %d  %-8s %-16s %s\n", c.ID, c.Name, c.Phone, c.Address)
+		}
+	}
+	fmt.Printf("\nИтого: заказов %d, списаний %d на %d",
 		state.Totals.Orders, state.Totals.Charged, state.Totals.ChargedTotal)
-	if len(state.Orders) > 0 {
+	if len(state.Clients) > 0 {
+		fmt.Printf(", профилей %d", len(state.Clients))
+	}
+	fmt.Println()
+	if len(state.Orders) > 0 || len(state.Clients) > 0 {
 		fmt.Println("Это состояние осталось от последней сцены. Сцена сбрасывает данные сама;")
 		fmt.Println("./lab reset пересоздаёт тома целиком, если стенд надо вернуть к чистому листу.")
 	}
