@@ -152,6 +152,15 @@ type ScriptConfig struct {
 	SLOErrorPct   float64 `json:"slo_error_pct"`  // обещанная доля отказов
 	ClosedClients int     `json:"closed_clients"` // сколько клиентов ходит по кругу в закрытой модели
 
+	// изменение системы: выкатка двух версий и переезд данных (m14)
+	Items      []Item `json:"items"`        // позиции заказа: новый вид запроса
+	Requests   int    `json:"requests"`     // сколько запросов подаётся в каждом прогоне
+	History    int    `json:"history"`      // сколько заказов лежит в старом месте до переезда
+	Batch      int    `json:"batch"`        // размер партии переливки
+	FlowFirst  int    `json:"flow_first"`   // поток заказов сразу после включения двойной записи
+	FlowSecond int    `json:"flow_second"`  // поток заказов между партиями
+	LostCopyAt int    `json:"lost_copy_at"` // у какого по счёту заказа потока копия не доедет
+
 	// периметр и право доступа (m13)
 	Stranger     string  `json:"stranger"`      // второй клиент: тот, чей заказ не его
 	Neighbor     string  `json:"neighbor"`      // как зовут соседа по сети в timeline
@@ -160,6 +169,13 @@ type ScriptConfig struct {
 	IntrospectMS int     `json:"introspect_ms"` // сколько эмитент думает над ответом
 	PollMS       int     `json:"poll_ms"`       // с каким шагом клиент опрашивает службу
 	RevokeAtS    float64 `json:"revoke_at_s"`   // на какой секунде прогона отзываются права
+}
+
+// Item — позиция заказа. Сумму из них складывает служба: в этом и состоит
+// изменение контракта, вокруг которого стоит сцена 39.
+type Item struct {
+	Name  string `json:"name"`
+	Price int64  `json:"price"`
 }
 
 // Значения по умолчанию у ручек обмена — не «на всякий случай», а часть

@@ -48,6 +48,16 @@ type knobs struct {
 
 	// Необязательная часть ответа: при деградации заказ принимается без неё.
 	Degrade bool `json:"degrade"`
+
+	// Двойная запись на время переезда данных (m14 l02). Включено — каждый
+	// принятый заказ уходит копией в новое место; выключено — служба работает
+	// ровно как работала. Ручка старого владельца, а не нового: пока владение
+	// не передано, кто пишет в оба места, решает тот, у кого истина.
+	Mirror bool `json:"mirror"`
+	// Сколько ближайших копий не доедет. Копия уходит вне транзакции, и её
+	// потеря вызывающему не видна — сцена делает эту потерю ровно один раз,
+	// чтобы сверке было что найти.
+	MirrorDropNext int `json:"mirror_drop_next"`
 }
 
 func defaultKnobs() knobs {
@@ -57,6 +67,7 @@ func defaultKnobs() knobs {
 		NotifyRetries: 0, NotifyRetryMS: 0, NotifySchema: "v1",
 		Breaker: false, BreakerFails: 5, BreakerOpenMS: 5000,
 		Degrade: false,
+		Mirror:  false, MirrorDropNext: 0,
 	}
 }
 
@@ -91,6 +102,23 @@ func (c *control) knobs() knobs {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.k
+}
+
+// mirrorDecision отвечает на два вопроса разом: включена ли двойная запись и
+// доедет ли эта конкретная копия. Счётчик «сколько ближайших копий уронить»
+// уменьшается здесь же — сцена ставит его перед нужным заказом, и потеря
+// случается ровно там, где ей назначено, а не «иногда».
+func (c *control) mirrorDecision() (on, dropped bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.k.Mirror {
+		return false, false
+	}
+	if c.k.MirrorDropNext > 0 {
+		c.k.MirrorDropNext--
+		return true, true
+	}
+	return true, false
 }
 
 // ── каталог: сценарий чтения, на котором живут нагрузочные сцены ────────────
@@ -324,6 +352,8 @@ func (a *app) handleLabConfig(w http.ResponseWriter, r *http.Request) {
 		BreakerFails    *int    `json:"breaker_fails"`
 		BreakerOpenMS   *int    `json:"breaker_open_ms"`
 		Degrade         *bool   `json:"degrade"`
+		Mirror          *bool   `json:"mirror"`
+		MirrorDropNext  *int    `json:"mirror_drop_next"`
 		Reset           bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -352,6 +382,7 @@ func (a *app) handleLabConfig(w http.ResponseWriter, r *http.Request) {
 	set(&c.k.NotifyRetryMS, req.NotifyRetryMS)
 	set(&c.k.BreakerFails, req.BreakerFails)
 	set(&c.k.BreakerOpenMS, req.BreakerOpenMS)
+	set(&c.k.MirrorDropNext, req.MirrorDropNext)
 	if req.NotifyMode != nil {
 		c.k.NotifyMode = *req.NotifyMode
 	}
@@ -363,6 +394,9 @@ func (a *app) handleLabConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Degrade != nil {
 		c.k.Degrade = *req.Degrade
+	}
+	if req.Mirror != nil {
+		c.k.Mirror = *req.Mirror
 	}
 	k := c.k
 	c.mu.Unlock()

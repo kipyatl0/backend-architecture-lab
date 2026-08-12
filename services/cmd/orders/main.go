@@ -64,6 +64,16 @@ type config struct {
 	// контекст пользователя, проверяет подпись под ним и отдаёт заказ только
 	// его владельцу. Переключатель сцены, а не свойство сервиса.
 	Authz bool `json:"authz"`
+
+	// Какая версия сервиса сейчас работает (m14 l01). Выкатка не мгновенна:
+	// инстансы обновляются по одному, и на время выката за одним адресом стоят
+	// обе версии сразу. Здесь это ручка, потому что двух образов сцене не нужно —
+	// нужно поведение двух версий, и оно ровно в двух местах:
+	//
+	//   v1 — сумму заказа принимает только полем amount, статусов знает четыре;
+	//   v2 — понимает и amount, и список позиций items, а заказ заводит новым
+	//        шагом процесса, статусом packing.
+	Version string `json:"version"`
 }
 
 func defaults() config {
@@ -72,6 +82,7 @@ func defaults() config {
 		Saga: false, FailStep: "", Compensate: true,
 		ReadFrom: "primary", CacheTTLMS: 2000, CardMS: 200, SingleFlight: false,
 		CacheMode: "shared", Propagate: false, Authz: false,
+		Version: "v1",
 	}
 }
 
@@ -140,6 +151,8 @@ func main() {
 	mux.HandleFunc("POST /_lab/emit", a.handleEmit)
 	mux.HandleFunc("POST /_lab/bulk-cancel", a.handleBulkCancel)
 	mux.HandleFunc("POST /_lab/erase", a.handleErase)
+	mux.HandleFunc("POST /_lab/mirror", a.handleMirror)
+	mux.HandleFunc("POST /_lab/drop-copy", a.handleDropCopy)
 	mux.HandleFunc("POST /_lab/cdc-reset", a.handleCDCReset)
 	mux.HandleFunc("GET /_lab/state", a.handleState)
 	mux.HandleFunc("GET /orders/{id}", a.handleReadOrder)
@@ -240,6 +253,13 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Client     string `json:"client"`
 		Restaurant string `json:"restaurant"`
 		Amount     int64  `json:"amount"`
+		// Новый вид запроса (m14 l01): сумма не приходит отдельным полем, её
+		// складывают из позиций. Старая версия про это поле не знает вовсе —
+		// она собрана до того, как оно появилось.
+		Items []struct {
+			Name  string `json:"name"`
+			Price int64  `json:"price"`
+		} `json:"items"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
 		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -253,7 +273,29 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event := lab.Msg{Type: "order.paid", Amount: req.Amount, Client: req.Client}
+	// Всё изменение контракта целиком. Новая версия понимает оба вида запроса —
+	// расширение раньше сужения, — и заводит заказ новым шагом процесса.
+	amount, status := req.Amount, "paid"
+	if cfg.Version == "v2" {
+		if len(req.Items) > 0 {
+			amount = 0
+			for _, it := range req.Items {
+				amount += it.Price
+			}
+		}
+		status = "packing"
+	}
+	if amount <= 0 {
+		// Старая версия видит запрос без суммы. Не «не поняла новое поле» —
+		// про новое поле она не знает и знать не может: для неё это запрос без
+		// обязательного поля, и другого ответа у неё нет.
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"code": "amount_required", "error": "сумма заказа не указана",
+		})
+		return
+	}
+
+	event := lab.Msg{Type: "order.paid", Amount: amount, Client: req.Client}
 
 	var id int64
 	switch cfg.WriteMode {
@@ -262,8 +304,8 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// ни другого: третьего состояния эта запись не допускает.
 		err := pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 			if err := tx.QueryRow(ctx,
-				`INSERT INTO orders (client, restaurant, amount, status) VALUES ($1,$2,$3,'paid') RETURNING id`,
-				req.Client, req.Restaurant, req.Amount).Scan(&id); err != nil {
+				`INSERT INTO orders (client, restaurant, amount, status) VALUES ($1,$2,$3,$4) RETURNING id`,
+				req.Client, req.Restaurant, amount, status).Scan(&id); err != nil {
 				return err
 			}
 			event.Order = id
@@ -283,8 +325,8 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 	default: // none и direct пишут заказ обычной вставкой
 		_, dbSpan := a.tracer.Start(ctx, "запись заказа", lab.KindClient)
 		err := a.pool.QueryRow(ctx,
-			`INSERT INTO orders (client, restaurant, amount, status) VALUES ($1,$2,$3,'paid') RETURNING id`,
-			req.Client, req.Restaurant, req.Amount).Scan(&id)
+			`INSERT INTO orders (client, restaurant, amount, status) VALUES ($1,$2,$3,$4) RETURNING id`,
+			req.Client, req.Restaurant, amount, status).Scan(&id)
 		dbSpan.End()
 		if err != nil {
 			lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -588,6 +630,7 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 		CacheMode        *string `json:"cache_mode"`
 		Propagate        *bool   `json:"propagate"`
 		Authz            *bool   `json:"authz"`
+		Version          *string `json:"version"`
 		Reset            bool    `json:"reset"`
 	}
 	if err := lab.ReadJSON(r, &req); err != nil {
@@ -638,6 +681,9 @@ func (a *app) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Authz != nil {
 		a.cfg.Authz = *req.Authz
+	}
+	if req.Version != nil {
+		a.cfg.Version = *req.Version
 	}
 	cfg := a.cfg
 	a.mu.Unlock()
@@ -735,6 +781,74 @@ func (a *app) handleBulkCancel(w http.ResponseWriter, r *http.Request) {
 	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": n})
 }
 
+// ── новое место на время переезда (m14 l02) ─────────────────────────────────
+//
+// Пока данные переезжают, у одной записи два места жительства. Копию сюда
+// присылает старый владелец — и только он: номер заказа принадлежит старому
+// месту, и если новое место начнёт нумеровать само, две копии одной записи
+// разъедутся по идентификаторам, а сверять их станет нечем.
+//
+// Ручка одна на оба источника копий — и на двойную запись, и на переливку
+// партиями: разница между ними не в том, как записать, а в том, кто и когда
+// шлёт. Запись идёт вставкой с обновлением: партия может встретить строку,
+// которую двойная запись уже принесла, и падать на этом нельзя.
+
+func (a *app) handleMirror(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID         int64  `json:"id"`
+		Client     string `json:"client"`
+		Restaurant string `json:"restaurant"`
+		Amount     int64  `json:"amount"`
+		Status     string `json:"status"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.ID <= 0 {
+		lab.WriteJSON(w, http.StatusBadRequest,
+			map[string]string{"error": "копия без номера заказа: нумерует старое место"})
+		return
+	}
+	if _, err := a.pool.Exec(r.Context(), `
+		INSERT INTO orders (id, client, restaurant, amount, status) VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (id) DO UPDATE
+		   SET client = EXCLUDED.client, restaurant = EXCLUDED.restaurant,
+		       amount = EXCLUDED.amount, status = EXCLUDED.status`,
+		req.ID, req.Client, req.Restaurant, req.Amount, req.Status); err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// Номера пришли снаружи, и собственный счётчик о них не знает. После
+	// переноса владения нумеровать начнёт этот сервис — с того места, до
+	// которого дошло старое, а не с начала.
+	if _, err := a.pool.Exec(r.Context(),
+		`SELECT setval('orders_id_seq', GREATEST((SELECT max(id) FROM orders), 1))`); err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"order": req.ID})
+}
+
+// handleDropCopy убирает из нового места строку, которой в старом уже нет.
+// Это и есть разрешение расхождения третьего вида: правило «истина в старом
+// месте» действует в обе стороны, а не только на недостачу.
+func (a *app) handleDropCopy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order int64 `json:"order"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tag, err := a.pool.Exec(r.Context(), `DELETE FROM orders WHERE id=$1`, req.Order)
+	if err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": tag.RowsAffected()})
+}
+
 func (a *app) handleErase(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Order int64 `json:"order"`
@@ -822,17 +936,20 @@ func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
 	type order struct {
 		ID     int64  `json:"id"`
 		Client string `json:"client"`
-		Amount int64  `json:"amount"`
-		Status string `json:"status"`
-		Charge string `json:"charge"`
+		// Ресторан отдаётся вместе с остальным: сверка переезда (m14 l02)
+		// сравнивает записи по всем полям сразу, а не по одному.
+		Restaurant string `json:"restaurant"`
+		Amount     int64  `json:"amount"`
+		Status     string `json:"status"`
+		Charge     string `json:"charge"`
 	}
 	var orders []order
 	rows, err := a.pool.Query(ctx,
-		`SELECT id, client, amount, status, coalesce(charge,'') FROM orders ORDER BY id`)
+		`SELECT id, client, restaurant, amount, status, coalesce(charge,'') FROM orders ORDER BY id`)
 	if err == nil {
 		for rows.Next() {
 			var o order
-			if err := rows.Scan(&o.ID, &o.Client, &o.Amount, &o.Status, &o.Charge); err == nil {
+			if err := rows.Scan(&o.ID, &o.Client, &o.Restaurant, &o.Amount, &o.Status, &o.Charge); err == nil {
 				orders = append(orders, o)
 			}
 		}

@@ -76,6 +76,11 @@ type app struct {
 	// заполнено в профиле split (модуль уехал за сеть).
 	notifier     string
 	notifyClient *http.Client
+
+	// Куда уходит копия заказа, пока данные переезжают в новое место (m14 l02).
+	// Заполнено там, где новое место вообще есть; двойную запись при этом
+	// включает сцена, а не наличие адреса.
+	orders string
 }
 
 // querier — то общее, что есть у пула и у транзакции. Модуль уведомлений в
@@ -108,6 +113,7 @@ func main() {
 		client:   &http.Client{Timeout: lab.EnvDuration("LAB_ACQUIRER_TIMEOUT", 120*time.Second)},
 		ctl:      newControl(),
 		notifier: lab.Env("LAB_NOTIFIER_URL", ""),
+		orders:   lab.Env("LAB_ORDERS_URL", ""),
 		// Таймаут вызова уведомлений задаёт сцена, а не клиент: в курсе
 		// таймаут — часть контракта, и трогать его должен тот, кто ставит опыт.
 		notifyClient: &http.Client{},
@@ -137,6 +143,8 @@ func main() {
 	mux.HandleFunc("GET /_lab/metrics", a.handleLabMetrics)
 	mux.HandleFunc("GET /_lab/buckets", a.handleLabBuckets)
 	mux.HandleFunc("POST /_lab/shutdown", a.handleLabShutdown)
+	mux.HandleFunc("POST /_lab/cancel", a.handleLabCancel)
+	mux.HandleFunc("POST /_lab/erase", a.handleLabErase)
 
 	if err := lab.Serve(lab.Env("LAB_ADDR", ":8080"), mux, log, nil); err != nil {
 		log.Error("сервис остановлен с ошибкой", "err", err)
@@ -211,6 +219,10 @@ func (a *app) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		lab.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
+	// Копия в новое место уходит после фиксации и вне транзакции. Иначе новое
+	// место могло бы уронить приём заказа, а на время переезда старое место
+	// обязано работать ровно так, как работало до него.
+	a.mirror(ctx, res, req)
 
 	// Есть ли кому отдать ответ? Контекст исходного запроса отменяется, когда
 	// клиент закрыл соединение, — это наблюдение, а не догадка.
@@ -306,6 +318,93 @@ func (a *app) createOrder(ctx context.Context, req createOrderRequest, attempt i
 		"charge", chargeID, "courier", courier)
 
 	return orderResult{Order: orderID, Status: "paid", Charge: chargeID, Courier: courier}, nil
+}
+
+// ── двойная запись на время переезда (m14 l02) ──────────────────────────────
+//
+// Ровно то, чем переезд данных отличается от «взяли и перенесли»: пока идёт
+// переливка, каждая новая запись должна оказаться в обоих местах. Пишет в оба
+// старый владелец — он и остаётся истиной до самого переноса владения.
+//
+// Вторая запись живёт вне транзакции первой, и это не небрежность стенда:
+// транзакции на два разных хранилища не бывает. Отсюда и цена приёма — та же,
+// что у двойной записи в m07 l01: копия может не доехать, и ни клиент, ни
+// старое место об этом не узнают. Узнает только сверка.
+func (a *app) mirror(ctx context.Context, res orderResult, req createOrderRequest) {
+	on, dropped := a.ctl.mirrorDecision()
+	if !on || a.orders == "" {
+		return
+	}
+	order := strconv.FormatInt(res.Order, 10)
+	if dropped {
+		a.rec.Record("mirror.lost#"+order, map[string]string{"order": order})
+		a.log.Info("копия в новое место не ушла", "order", res.Order)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"id": res.Order, "client": req.Client, "restaurant": req.Restaurant,
+		"amount": req.Amount, "status": res.Status,
+	})
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.orders+"/_lab/mirror",
+		bytes.NewReader(payload))
+	if err != nil {
+		a.log.Info("копия не отправлена", "order", res.Order, "err", err)
+		return
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	resp, err := a.client.Do(hreq)
+	if err != nil {
+		a.log.Info("копия не отправлена", "order", res.Order, "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		a.log.Info("новое место отказалось принять копию", "order", res.Order, "code", resp.StatusCode)
+		return
+	}
+	a.rec.Record("mirror.sent#"+order, map[string]string{"order": order})
+}
+
+// ── то, что делает не служба, а человек ─────────────────────────────────────
+//
+// Отмена дежурным и удаление данных по просьбе клиента — операции оператора,
+// а не функции приложения. Двойная запись их не видит: она навешана на приём
+// заказа, а тут заказ никто не принимает. Ровно из этой щели и берутся два
+// расхождения из трёх, которые находит сверка.
+
+func (a *app) handleLabCancel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order int64 `json:"order"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tag, err := a.pool.Exec(r.Context(), `UPDATE orders SET status='cancelled' WHERE id=$1`, req.Order)
+	if err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.log.Info("заказ отменён в старом месте", "order", req.Order)
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": tag.RowsAffected()})
+}
+
+func (a *app) handleLabErase(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Order int64 `json:"order"`
+	}
+	if err := lab.ReadJSON(r, &req); err != nil {
+		lab.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tag, err := a.pool.Exec(r.Context(), `DELETE FROM orders WHERE id=$1`, req.Order)
+	if err != nil {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	a.log.Info("строка удалена по просьбе клиента", "order", req.Order)
+	lab.WriteJSON(w, http.StatusOK, map[string]any{"rows": tag.RowsAffected()})
 }
 
 // charge — модуль payments зовёт внешний эквайринг.

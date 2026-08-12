@@ -116,6 +116,13 @@ func verifyTable(t Table, measured map[string]map[string]float64) ([]string, []s
 			}
 			name := r.Key + "." + c.Field
 			switch {
+			// Проверка без допуска и без границ не проверяет ничего и потому
+			// опаснее её отсутствия: в сценарии она выглядит как проверка.
+			// Молчать о таких нельзя — сцена должна падать на них так же
+			// громко, как на разошедшемся числе.
+			case c.Min == nil && c.Max == nil && c.Tol <= 0 && c.TolPct <= 0:
+				problems = append(problems, fmt.Sprintf(
+					"%s: проверка без допуска и границ ничего не проверяет", name))
 			case c.Min != nil && got < *c.Min:
 				problems = append(problems, fmt.Sprintf(
 					"%s: наблюдение %.1f, а сцена требует не меньше %.1f", name, got, *c.Min))

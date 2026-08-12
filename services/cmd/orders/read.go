@@ -214,6 +214,21 @@ func (a *app) handleReadOrder(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// Статус разбирается по перечню известных значений — как разбирает его
+	// любой enum. Старая версия собрана до того, как в процессе появился новый
+	// шаг, и значения packing для неё не существует: это не «неизвестное поле,
+	// которое можно пропустить», а невозможное состояние.
+	//
+	// Отсюда и берётся точка невозврата (m14 l01): откатить код — минута,
+	// а строки, которые новая версия успела написать, откатывать нечем.
+	if cfg.Version != "v2" && !knownStatusV1(status) {
+		lab.WriteJSON(w, http.StatusInternalServerError, map[string]any{
+			"order": id, "code": "unknown_status",
+			"error": "неизвестный статус заказа: " + status,
+		})
+		return
+	}
+
 	// Владелец заказа известен только здесь: у периметра этих данных нет и быть
 	// не может. Поэтому решение «твой ли это заказ» принимается рядом с данными,
 	// а не на границе сети.
@@ -228,6 +243,17 @@ func (a *app) handleReadOrder(w http.ResponseWriter, r *http.Request) {
 		"order": id, "found": true, "source": source,
 		"client": client, "restaurant": restaurant, "amount": amount, "status": status,
 	})
+}
+
+// knownStatusV1 — статусы, которые знала версия, работавшая до изменения.
+// Перечень закрытый, и в этом весь смысл: открытый перечень пережил бы новое
+// значение молча, а закрытый на нём останавливается.
+func knownStatusV1(s string) bool {
+	switch s {
+	case "created", "paid", "assigned", "cancelled":
+		return true
+	}
+	return false
 }
 
 // ── карточка ресторана: дешёвое чтение через кэш ────────────────────────────
